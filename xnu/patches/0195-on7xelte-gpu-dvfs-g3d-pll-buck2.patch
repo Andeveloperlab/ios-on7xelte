@@ -1,0 +1,284 @@
+--- a/bsd/dev/a5xelte_dvfs.c
++++ b/bsd/dev/a5xelte_dvfs.c
+@@ -123,6 +123,24 @@
+  *
+  * Boot-arg a5cpufreq=MHZ applies a level once, 20 s after USB start.
+  *
++ * 0195: the GPU (Mali-T830, G3D domain) the same way:
++ *
++ *   gpufreq        show G3D_PLL, its mux, BUCK2 (vdd_g3d) and the G3D EMA
++ *   gpufreq MHZ    set a stock ECT level (343 450 545 676 728 845 1001). The
++ *                  BUCK2 voltage is the highest one of the stock ASV tables
++ *                  for that level (all 16 groups, all 7 table versions),
++ *                  never above 1.05 V.
++ *
++ * Boot-arg a5gpufreq=MHZ applies a level once, 10 s after USB start, before
++ * the GPU is first used (on7mali's probe starts ~20 s after boot, and its
++ * step 4 cycle counter then shows the clock). The bootloader leaves G3D_PLL
++ * at 343 MHz (P 13 M 343 S 1, ECT's boot level) and nothing else changes it.
++ * Above 545 MHz a thermal guard drops the GPU to 343 MHz at DV_HOT_C + 5.
++ * Sources: the ECT in the phone's bootloader (PLL G3D_PLL, ASV dvfs_g3d,
++ * DVFS dvfs_g3d: bus div 0 and apb div 3 at every level, so only the PLL
++ * changes), gpu_exynos7870.c (vdd_g3d = S2MPU05 BUCK2), S5E7870-asv.c
++ * dfsg3d_set_ema (fuse-less defaults: 0x12 0x12 0x22 at 750 mV and up).
++ *
+  * Sources: Samsung 3.18 kernel for the J7 Prime (i2c-exynos5.c batcher
+  * transfer, s2mpu05 regulator, pwrcal S5E7870 PLL141xx / EMA / dividers)
+  * and the ECT tables in the phone's own bootloader.
+@@ -206,11 +224,21 @@
+ #define EMA_LOW                 0x12492u
+ #define EMA_HIGH                0x1b6d2u    /* pwrcal default when the fuses are 0 */
+ #define TMU_PA                  0x10130000ull
++#define PMU_PA                  0x10480000ull   /* PMU_ALIVE: G3D_STATUS at +0x4004 */
++#define PMU_G3D_STATUS          0x4004
++#define CMU_G3D_PA              0x11460000ull   /* G3D_PLL at the same offsets as the CPU PLLs */
++#define SYSREG_G3D_PA           0x11450000ull
++#define G3D_EMA_RA1             0x304
++#define G3D_EMA_RF1             0x314
++#define G3D_EMA_RF2             0x31c
++#define PMIC_B2CTRL1            0x1c
++#define PMIC_B2CTRL2            0x1d    /* BUCK2 (vdd_g3d) voltage, same steps as BUCK1 */
++#define BUCK2_MAX_UV            1050000u
+ #define GICD_PA                 0x104e1000ull
+ #define HSI2C_INTID_MASK        ((1u << 19) | (1u << 20))  /* INTID 403, 404 in word 12 */
+ 
+ static struct {
+-	vm_offset_t i2c, cmu[2], sysreg[2], tmu, gicd, gpm0;
++	vm_offset_t i2c, cmu[2], sysreg[2], tmu, gicd, gpm0, pmu, g3d_cmu, g3d_sysreg;
+ 	bool        gic_checked, started;
+ 	volatile bool busy;
+ 	char        wcmd[16], warg[512];
+@@ -226,6 +254,8 @@
+ 	uint32_t    target_khz;     /* level asked for; thermal steps climb back to it */
+ 	uint32_t    step_tick;      /* tick of the last thermal step */
+ 	uint32_t    slave;          /* 0 = PMIC, else this 7-bit address (RTC) */
++	uint32_t    gpu_khz;        /* 0195: last G3D level set here, 0 = bootloader's */
++	uint32_t    gpu_boot_khz;   /* a5gpufreq */
+ 	int         posting;
+ 	bool        mapped;
+ } dv;
+@@ -255,6 +285,21 @@
+ };
+ #define DV_BOOT_LV 6    /* 902 MHz */
+ 
++/* 0195: G3D levels from the ECT (PLL G3D_PLL; ASV dvfs_g3d, highest voltage of all groups and tables) */
++static const struct {
++	uint32_t khz, uv;
++	uint8_t  p, s;
++	uint16_t m;
++} gv_lv[] = {
++	{ 1001000, 1006250,  4, 0, 154 },
++	{  845000,  925000,  4, 0, 130 },
++	{  728000,  875000,  4, 0, 112 },
++	{  676000,  812500,  4, 0, 104 },
++	{  545000,  750000, 13, 1, 545 },
++	{  450000,  750000, 13, 1, 450 },
++	{  343000,  750000, 13, 1, 343 },
++};
++
+ static uint32_t
+ rd32(vm_offset_t b, uint32_t off)
+ {
+@@ -283,8 +328,11 @@
+ 		dv.tmu = ml_io_map((vm_offset_t)TMU_PA, 0x1000);
+ 		dv.gicd = ml_io_map((vm_offset_t)GICD_PA, 0x1000);
+ 		dv.gpm0 = ml_io_map((vm_offset_t)GPM0_PA, 0x1000);
++		dv.pmu = ml_io_map((vm_offset_t)PMU_PA, 0x5000);
++		dv.g3d_cmu = ml_io_map((vm_offset_t)CMU_G3D_PA, 0x1000);
++		dv.g3d_sysreg = ml_io_map((vm_offset_t)SYSREG_G3D_PA, 0x1000);
+ 		dv.mapped = dv.i2c && dv.cmu[0] && dv.cmu[1] && dv.sysreg[0] && dv.sysreg[1] && dv.tmu && dv.gicd &&
+-		    dv.gpm0;
++		    dv.gpm0 && dv.pmu && dv.g3d_cmu && dv.g3d_sysreg;
+ 		if (!dv.mapped) {
+ 			printf("USB> dvfs: map failed\n");
+ 		}
+@@ -594,6 +642,29 @@
+ 	return 0;
+ }
+ 
++/* 0195: only ever called for BUCK2 with a level's voltage (or the one read before) */
++static int
++pm_set_buck2(uint32_t uv)
++{
++	uint8_t sel, back = 0, msg[2];
++	if (uv < 550000 || uv > BUCK2_MAX_UV) {
++		printf("USB> pmic: refusing BUCK2 %u uV\n", uv);
++		return -1;
++	}
++	sel = (uint8_t)((uv - 400000 + 6249) / 6250);
++	msg[0] = PMIC_B2CTRL2;
++	msg[1] = sel;
++	if (pm_xfer(false, msg, 2, true)) {
++		return -1;
++	}
++	delay(1000);
++	if (pm_read(PMIC_B2CTRL2, &back) || back != sel) {
++		printf("USB> pmic: BUCK2 read back 0x%02x, wanted 0x%02x\n", back, sel);
++		return -1;
++	}
++	return 0;
++}
++
+ /*
+  * 0157: LDO25 (S2MPU05 L25CTRL 0x47) feeds the cod3026x core (DT
+  * vdd-supply = ldo25_reg, 1.8 V).  The bootloader leaves it off (0x28:
+@@ -1074,6 +1145,111 @@
+ 	return 0;
+ }
+ 
++/* ---- GPU (G3D) ---- */
++
++/* CMU_G3D / SYSREG_G3D are only read with the G3D power domain on: a read with it off hangs the bus */
++static bool
++gv_on(void)
++{
++	return (rd32(dv.pmu, PMU_G3D_STATUS) & 0xf) == 0xf;
++}
++
++static void
++gv_show(void)
++{
++	uint8_t c1 = 0, c2 = 0;
++	if (!gv_on()) {
++		printf("USB> gpufreq: G3D domain off (PMU status 0x%08x)\n", rd32(dv.pmu, PMU_G3D_STATUS));
++		return;
++	}
++	uint32_t con0 = rd32(dv.g3d_cmu, PLL_CON0);
++	printf("USB> gpufreq: G3D_PLL 0x%08x = %u kHz%s, mux 0x%08x, div bus %u apb %u, EMA %02x %02x %02x\n",
++	    con0, pll_khz(con0), (con0 & (1u << 29)) ? " locked" : "", rd32(dv.g3d_cmu, MUX_CPU_PLL),
++	    rd32(dv.g3d_cmu, 0x400) & 0xf, rd32(dv.g3d_cmu, 0x404) & 0xf, rd32(dv.g3d_sysreg, G3D_EMA_RA1),
++	    rd32(dv.g3d_sysreg, G3D_EMA_RF1), rd32(dv.g3d_sysreg, G3D_EMA_RF2));
++	if (pm_read(PMIC_B2CTRL1, &c1) == 0 && pm_read(PMIC_B2CTRL2, &c2) == 0) {
++		printf("USB> gpufreq: BUCK2 ctrl1 0x%02x, vsel 0x%02x = %u uV, %d C\n", c1, c2, BUCK1_UV(c2), dv_temp());
++	}
++}
++
++static void
++gv_ema(uint32_t uv)
++{
++	wr32(dv.g3d_sysreg, G3D_EMA_RA1, 0x12);
++	wr32(dv.g3d_sysreg, G3D_EMA_RF1, 0x12);
++	wr32(dv.g3d_sysreg, G3D_EMA_RF2, uv >= 750000 ? 0x22 : 0x24);
++}
++
++static int
++gv_set(uint32_t khz)
++{
++	int lv = -1;
++	uint8_t vsel = 0;
++	uint32_t cur_uv, con0;
++
++	for (int i = 0; i < (int)(sizeof(gv_lv) / sizeof(gv_lv[0])); i++) {
++		if (khz / 1000 == gv_lv[i].khz / 1000) {
++			lv = i;
++			break;
++		}
++	}
++	if (lv < 0) {
++		printf("USB> gpufreq: levels 1001 845 728 676 545 450 343\n");
++		return -1;
++	}
++	if (gv_lv[lv].uv > BUCK2_MAX_UV) {
++		return -1;
++	}
++	if (!gv_on()) {
++		printf("USB> gpufreq: G3D domain off, nothing changed\n");
++		return -1;
++	}
++	int t = dv_temp();
++	if (gv_lv[lv].khz > 545000 && t >= DV_HOT_C) {
++		printf("USB> gpufreq: %d C, not raising\n", t);
++		return -1;
++	}
++	con0 = rd32(dv.g3d_cmu, PLL_CON0);
++	if (!(con0 & (1u << 31)) || !((rd32(dv.g3d_cmu, MUX_CPU_PLL) >> 12) & 1)) {
++		printf("USB> gpufreq: G3D_PLL off or not selected (0x%08x)\n", con0);
++		return -1;
++	}
++	if (pm_read(PMIC_B2CTRL2, &vsel)) {
++		return -1;
++	}
++	cur_uv = BUCK1_UV(vsel);
++	if (cur_uv < 550000 || cur_uv > 1100000) {
++		printf("USB> gpufreq: BUCK2 reads %u uV, giving up\n", cur_uv);
++		return -1;
++	}
++
++	/* up: voltage, EMA, clock. down: clock, EMA, voltage. */
++	if (gv_lv[lv].uv > cur_uv) {
++		if (pm_set_buck2(gv_lv[lv].uv)) {
++			return -1;
++		}
++		gv_ema(gv_lv[lv].uv);
++	}
++	con0 &= ~((0x3ffu << 16) | (0x3fu << 8) | 7u);
++	con0 |= ((uint32_t)gv_lv[lv].m << 16) | ((uint32_t)gv_lv[lv].p << 8) | gv_lv[lv].s;
++	con0 &= ~(1u << 26);
++	con0 |= (1u << 5);
++	if (pll_set(dv.g3d_cmu, con0, gv_lv[lv].p)) {
++		printf("USB> gpufreq: G3D_PLL failed, now 0x%08x; BUCK2 left at %u uV\n", rd32(dv.g3d_cmu, PLL_CON0),
++		    cur_uv > gv_lv[lv].uv ? cur_uv : gv_lv[lv].uv);
++		gv_show();
++		return -1;
++	}
++	if (gv_lv[lv].uv < cur_uv) {
++		gv_ema(gv_lv[lv].uv);
++		pm_set_buck2(gv_lv[lv].uv);
++	}
++	dv.gpu_khz = gv_lv[lv].khz;
++	printf("USB> gpufreq: %u kHz at %u uV (G3D_PLL 0x%08x), %d C\n", gv_lv[lv].khz,
++	    gv_lv[lv].uv > cur_uv || gv_lv[lv].uv < cur_uv ? gv_lv[lv].uv : cur_uv, rd32(dv.g3d_cmu, PLL_CON0), dv_temp());
++	return 0;
++}
++
+ static uint32_t
+ dv_num(const char **s)
+ {
+@@ -1791,6 +1967,13 @@
+ 			}
+ 			printf("USB> pmic 0x%02x = 0x%02x\n", reg + i, v);
+ 		}
++	} else if (!strcmp(cmd, "gpufreq")) {
++		const char *s = arg;
++		if (*arg == '\0') {
++			gv_show();
++		} else {
++			gv_set(dv_num(&s) * 1000);
++		}
+ 	} else {
+ 		if (*arg == '\0') {
+ 			dv_show();
+@@ -1867,7 +2050,8 @@
+ a5xelte_dvfs_command(const char *cmd, const char *arg)
+ {
+ 	if (strcmp(cmd, "temp") && strcmp(cmd, "pmic") && strcmp(cmd, "cpufreq") && strcmp(cmd, "reg") &&
+-	    strcmp(cmd, "time") && strcmp(cmd, "codec") && strcmp(cmd, "aud") && strcmp(cmd, "wifi")) {
++	    strcmp(cmd, "time") && strcmp(cmd, "codec") && strcmp(cmd, "aud") && strcmp(cmd, "wifi") &&
++	    strcmp(cmd, "gpufreq")) {
+ 		return false;
+ 	}
+ 	dv_post(cmd, arg);
+@@ -1904,6 +2088,23 @@
+ 		if (PE_parse_boot_argn("a5cpufreq", &mhz, sizeof(mhz)) && mhz) {
+ 			dv.boot_khz = mhz * 1000;
+ 		}
++		mhz = 0;
++		if (PE_parse_boot_argn("a5gpufreq", &mhz, sizeof(mhz)) && mhz) {
++			dv.gpu_boot_khz = mhz * 1000;
++		}
++	}
++	if (dv.gpu_boot_khz && dv.ticks == 10) {
++		char a[16];
++		snprintf(a, sizeof(a), "%u", dv.gpu_boot_khz / 1000);
++		printf("USB> gpufreq: a5gpufreq=%s\n", a);
++		dv_post("gpufreq", a);
++		dv.gpu_boot_khz = 0;
++	}
++	if (dv.mapped && dv.gpu_khz > 545000 && !dv.busy && dv.ticks - dv.step_tick >= DV_STEP_S &&
++	    dv_temp() >= DV_HOT_C + 5) {
++		printf("USB> gpufreq: %d C, %u -> 343 MHz\n", dv_temp(), dv.gpu_khz / 1000);
++		dv.step_tick = dv.ticks;
++		dv_post("gpufreq", "343");
+ 	}
+ 	if (dv.boot_khz && dv.ticks == 20) {
+ 		char a[16];
