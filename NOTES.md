@@ -585,6 +585,37 @@ for the user's OK: it raises the GPU voltage and clock):**
   drops to 343 MHz at 85 C); then the path to the screen (IOSurface import
   / eagl).
 
+**a5gpufreq=1001 STANDARD + CA ON THE GPU, STEP 1 PREPARED (0196 + tools/eagl, commit
+3bb2193; NOT built locally, NOT booted):**
+- `candidates/pipeline.ps1` (outside git) cmdline now has `a5gpufreq=1001` (backup
+  `pipeline.ps1.bak-gpufreq`). The user saw no speedup at 1001 MHz: [O] the UI is still
+  CA's CPU renderer (no EAGL/Metal), the GPU only runs gl_test.
+- [O] Why a library could not be put into backboardd: the kernel has no MAC policy named
+  "AMFI", so dyld's policy request (0x5a) gets ENOPOLICY -> restricted (xnu91 "@ path"
+  refusal). 0196 (boot-arg `on7gl=1` only): policy "AMFI" answers allow-all to backboardd
+  only; kern_exec.c adds `DYLD_INSERT_LIBRARIES=/usr/local/bin/libon7gl.dylib` to
+  backboardd's exec; sysctl `kern.on7gl_log` (any user) -> `ON7 GL> ...` lines.
+  Logs: `ON7 GL: AMFI dyld policy ... registered`, `ON7 GL: backboardd started with ...`,
+  `ON7 GL: dyld policy for backboardd[N]: allow all`.
+- tools/eagl = the A50's eagl.c (MIT) + gl_osmesa.c, writes via kern.on7gl_log; own
+  surface_checksum.c. mesa.yml builds `bin/libon7gl.dylib` (artifact gpu-userland).
+- CI runs started for 3bb2193: xnu 43649190007, mesa 43649189968 (results not read).
+- [O] kern_exec.c does NOT compile with the local kcc.py (104 errors even unchanged:
+  kfree_type etc. need Apple clang). Plan: take kern_exec.o from the new CI run's
+  .link kit (xnu-kernel artifact) and `ar r` it into the old kit:
+  `scratchpad/xnu-local196.sh` (PREBUILT=...), `scratchpad/build199.sh` (expects
+  `scratchpad/k196/kern_exec.o` and payload header `scratchpad/p199/on7put_payload.h`).
+  sweet_amfi.c with 0196 compiles locally without warnings.
+- NEXT: (1) check both CI runs; (2) extract kern_exec.o into scratchpad/k196; (3)
+  payload p199 = glfill files + `/usr/local/bin/libon7gl.dylib=...,0755` (tools/
+  on7put-payload.py), build199.sh -> xnu95; (4) flash BOOT p10 with extra
+  `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1 on7gl=1 glcopy=1` (glcopy: the J7's
+  HakiosMali has no IOSurface import 0x7e, so surfaces are copied; [G] slow: one 1080p
+  texture upload took 94 ms in gl_test). Expect `hakios-gl: N of 8 methods of
+  EAGLContext are ours`. Risks [G]: eagl_slots.txt is iOS 16.5 20F66's OpenGLES table,
+  this root is 16.7; backboardd crash loop = black screen -> undo: flash without on7gl.
+  (5) then 0x7e zero-copy IOSurface import in HakiosMali for real speed.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
