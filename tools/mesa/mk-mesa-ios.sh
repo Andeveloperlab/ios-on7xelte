@@ -5,7 +5,8 @@
 # libdrm. Patches and hakios-drm come from the Galaxy A50 port (see README.md here).
 #
 #   tools/mesa/mk-mesa-ios.sh OUT       OUT gets libOSMesa.8.dylib and libglapi.0.dylib, install names
-#                                       /usr/local/lib/..., stripped (-x), ad-hoc signed
+#                                       @rpath/... (the phone has them beside gl_test in /usr/local/bin: the
+#                                       kernel's file installer makes no directories), stripped (-x), ad-hoc signed
 set -euo pipefail
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
@@ -61,20 +62,21 @@ meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false
 ninja -C build src/gallium/targets/osmesa/libOSMesa.8.dylib
 
-# the library and what it needs that is not the system's, named by where they go on the phone
+# the library and what it needs that is not the system's (@rpath/..., found by the program's rpath)
 osm=build/src/gallium/targets/osmesa/libOSMesa.8.dylib
 otool -L $osm
 cp $osm "$OUT/libOSMesa.8.dylib"
 for dep in $(otool -L $osm | awk 'NR > 1 { print $1 }' | grep -v '^/usr/lib/\|^/System/'); do
 	name=$(basename "$dep")
+	[ "$name" != libOSMesa.8.dylib ] || continue    # (its own install name, the first line)
 	src=$(find build -name "$name" -type f | head -1)
 	[ -n "$src" ] || { echo "missing $dep"; exit 1; }
 	cp "$src" "$OUT/$name"
-	install_name_tool -change "$dep" /usr/local/lib/$name "$OUT/libOSMesa.8.dylib"
+	install_name_tool -change "$dep" @rpath/$name "$OUT/libOSMesa.8.dylib"
 done
 for f in "$OUT"/*.dylib; do
 	strip -x "$f"
-	install_name_tool -id /usr/local/lib/$(basename "$f") "$f"
+	install_name_tool -id @rpath/$(basename "$f") "$f"
 	codesign -f -s - "$f"
 done
 otool -L "$OUT"/*.dylib

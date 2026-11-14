@@ -3,7 +3,9 @@
 `mk-mesa-ios.sh` builds Mesa 25.0.7's OSMesa (OpenGL ES 2, off-screen) for iOS arm64 with the
 gallium drivers panfrost (Midgard v5: the Mali-T830, `MODEL(0x830, ...)` in pan_props.c) and
 softpipe. CI: `.github/workflows/mesa.yml` (artifact `gpu-userland`: `lib/libOSMesa.8.dylib`,
-`lib/libglapi.0.dylib`, `bin/gl_test`, `bin/mali_test`; install names `/usr/local/lib/...`).
+`lib/libglapi.0.dylib`, `bin/gl_test`, `bin/mali_test`; install names `@rpath/...`, gl_test's
+rpath is its own directory and /usr/local/lib: on the phone all four go into /usr/local/bin, because
+the kernel's file installer (xnu 0194) makes no directories).
 
 panfrost talks to the kernel's `HakiosMali` (xnu patch 0193) through `hakios-drm/`, a stand-in
 for libdrm: a DRM ioctl's low byte is the IOKit selector, buffers are client memory of type =
