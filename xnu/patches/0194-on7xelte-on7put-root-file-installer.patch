@@ -1,0 +1,216 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -473,6 +473,203 @@
+  * of the tro_ucred field so that the uthread structure can be
+  * used like any other.
+  */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * on7put (on7xelte, 0194): put files into the root through the mounted HFS+ volume (its own driver, its
++ * journal) at the end of bsd_init, before launchd: test programs and their launchd jobs reach the phone with
++ * a BOOT flash, no userdata image write. Only with boot-arg on7put=1. The files come from on7put_payload.h,
++ * made by tools/on7put-payload.py for a local build (it holds an Apple launchd.plist: never committed);
++ * without it nothing is done. Per file:
++ *   already the payload (FNV-1a 64 + size)  -> left alone
++ *   "before" given and the file is not it   -> left alone (the root is not what the payload was made for)
++ *   "backup" given and not there yet        -> the current file copied there first
++ *   then written (O_TRUNC, IO_SYNC, fsync), mode set (uid/gid 0 only for a new file), read back and checked.
++ */
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++
++struct on7put_file {
++	const char *path;
++	uint32_t mode;
++	const unsigned char *data;
++	uint32_t len;
++	int has_before;
++	uint64_t before_hash;
++	uint32_t before_len;
++	const char *backup;
++};
++
++#if __has_include("on7put_payload.h")
++#include "on7put_payload.h"
++#else
++static const struct on7put_file on7put_files[] = { { NULL, 0, NULL, 0, 0, 0, 0, NULL } };
++#define ON7PUT_COUNT 0
++#define ON7PUT_TAG "none"
++#endif
++
++static uint64_t
++on7put_fnv(const unsigned char *p, size_t n)
++{
++	uint64_t h = 0xcbf29ce484222325ULL;
++
++	while (n--) {
++		h = (h ^ *p++) * 0x100000001b3ULL;
++	}
++	return h;
++}
++
++/* the whole file into a new buffer (*lenp bytes); ENOENT if it is not there */
++static int
++on7put_read(const char *path, unsigned char **bufp, uint32_t *lenp)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++	unsigned char *buf;
++	int err, resid = 0;
++	off_t size;
++
++	*bufp = NULL;
++	*lenp = 0;
++	if ((err = vnode_open(path, FREAD, 0, 0, &vp, ctx)) != 0) {
++		return err;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if ((err = vnode_getattr(vp, &va, ctx)) != 0) {
++		(void)vnode_close(vp, FREAD, ctx);
++		return err;
++	}
++	size = (off_t)va.va_data_size;
++	if (size < 0 || size > (16 << 20)) {
++		(void)vnode_close(vp, FREAD, ctx);
++		return EFBIG;
++	}
++	buf = kalloc_data((vm_size_t)size + 1, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		(void)vnode_close(vp, FREAD, ctx);
++		return ENOMEM;
++	}
++	err = size ? vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)size, 0, UIO_SYSSPACE, IO_NODELOCKED,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) : 0;
++	(void)vnode_close(vp, FREAD, ctx);
++	if (err == 0 && resid != 0) {
++		err = EIO;
++	}
++	if (err) {
++		kfree_data(buf, (vm_size_t)size + 1);
++		return err;
++	}
++	*bufp = buf;
++	*lenp = (uint32_t)size;
++	return 0;
++}
++
++static int
++on7put_write(const char *path, const unsigned char *data, uint32_t len, uint32_t mode, int created)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++	int err, err2, resid = 0;
++
++	if ((err = vnode_open(path, FWRITE | O_CREAT | O_TRUNC, (int)(mode & 07777), 0, &vp, ctx)) != 0) {
++		return err;
++	}
++	err = len ? vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE,
++	    IO_NODELOCKED | IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) : 0;
++	if (err == 0 && resid != 0) {
++		err = EIO;
++	}
++	if (err == 0) {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, (mode_t)(mode & 07777));
++		if (created) {         /* a new file: root:wheel; an old one keeps its owner (launchd.plist is 0:80) */
++			VATTR_SET(&va, va_uid, 0);
++			VATTR_SET(&va, va_gid, 0);
++		}
++		err = vnode_setattr(vp, &va, ctx);
++	}
++	if (err == 0) {
++		err = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	err2 = vnode_close(vp, FWRITE, ctx);
++	return err ? err : err2;
++}
++
++static void
++on7put_install(void)
++{
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("on7put", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	printf("ON7 PUT: payload %s, %d files\n", ON7PUT_TAG, ON7PUT_COUNT);
++	for (int i = 0; i < ON7PUT_COUNT; i++) {
++		const struct on7put_file *f = &on7put_files[i];
++		uint64_t want = on7put_fnv(f->data, f->len), have = 0;
++		unsigned char *cur = NULL;
++		uint32_t curlen = 0;
++		int err = on7put_read(f->path, &cur, &curlen);
++
++		if (err && err != ENOENT) {
++			printf("ON7 PUT: %s: read error %d, left alone\n", f->path, err);
++			continue;
++		}
++		if (err == 0) {
++			have = on7put_fnv(cur, curlen);
++		}
++		if (err == 0 && curlen == f->len && have == want) {
++			printf("ON7 PUT: %s: already the payload (%u bytes)\n", f->path, curlen);
++			kfree_data(cur, (vm_size_t)curlen + 1);
++			continue;
++		}
++		if (f->has_before && (err != 0 || curlen != f->before_len || have != f->before_hash)) {
++			printf("ON7 PUT: %s: is %s (%u bytes, %016llx), not the expected %u bytes %016llx: LEFT ALONE\n",
++			    f->path, err ? "missing" : "different", curlen, have, f->before_len, f->before_hash);
++			if (cur) {
++				kfree_data(cur, (vm_size_t)curlen + 1);
++			}
++			continue;
++		}
++		if (err == 0 && f->backup) {
++			unsigned char *old = NULL;
++			uint32_t oldlen = 0;
++			int e2 = on7put_read(f->backup, &old, &oldlen);
++
++			if (e2 == ENOENT) {
++				e2 = on7put_write(f->backup, cur, curlen, 0644, 1);
++				printf("ON7 PUT: %s: backup %s (%u bytes): %d\n", f->path, f->backup, curlen, e2);
++				if (e2) {
++					kfree_data(cur, (vm_size_t)curlen + 1);
++					continue;
++				}
++			} else {
++				printf("ON7 PUT: %s: backup %s already there (%d)\n", f->path, f->backup, e2);
++				if (old) {
++					kfree_data(old, (vm_size_t)oldlen + 1);
++				}
++			}
++		}
++		if (cur) {
++			kfree_data(cur, (vm_size_t)curlen + 1);
++			cur = NULL;
++		}
++		err = on7put_write(f->path, f->data, f->len, f->mode, err == ENOENT);
++		if (err == 0 && (err = on7put_read(f->path, &cur, &curlen)) == 0) {
++			have = on7put_fnv(cur, curlen);
++			if (curlen != f->len || have != want) {
++				err = EIO;
++			}
++			kfree_data(cur, (vm_size_t)curlen + 1);
++		}
++		printf("ON7 PUT: %s: written %u bytes mode %o, read back %s (%d)\n", f->path, f->len, f->mode,
++		    err ? "FAILED" : "ok", err);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
++
+ void
+ bsd_init(void)
+ {
+@@ -1074,6 +1271,9 @@
+ 	machine_timeout_bsd_init();
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	on7put_install();       /* 0194: boot-arg on7put=1 */
++#endif
+ 	bsd_init_kprintf("done\n");
+ }
+ 
