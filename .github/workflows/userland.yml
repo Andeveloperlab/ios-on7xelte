@@ -5,6 +5,11 @@ name: userland
 # them into the phone's root at boot.
 
 on:
+  # workflow_dispatch needs the file on the default branch; a push of the sources runs it on any branch
+  push:
+    paths:
+      - tools/mali_test/**
+      - .github/workflows/userland.yml
   workflow_dispatch:
     inputs:
       runner:
