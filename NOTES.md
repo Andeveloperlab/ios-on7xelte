@@ -474,6 +474,43 @@ waits for the user's OK: it writes 3 files into the iOS root on userdata):**
   the J7's HakiosMali does not have yet) / CoreAnimation via the a50's
   eagl/OSMesa approach.
 
+**FULL-SCREEN FILL TIMING ON THE T830 (xnu93, boot 00:38 local 2026-11-15, same
+extra boot-args, usblog `candidates/xnu14/usblog-20261114-154207-ts.txt`):**
+- gl_test step 5 (commit 7a7087c, CI run 43643435934): after the a50's
+  `gl_test fill`. A 1080x1920 texture as the framebuffer; per kind 16 frames,
+  glFinish each. `gl_test [ROUNDS [W H]]`, W 0 skips it; watchdog 120 s.
+- xnu93 = xnu92 code + payload `glfill-43643435934` (only gl_test new, sha256
+  8f40228c...21b2; mali_test + lib from p195 = "already the payload"),
+  `candidates/xnu93.kernel`, `scratchpad/build197.sh`. Boot image sha256
+  7499f9f4...784f.
+- [O] gl_test pid 96: `ALL OK`, exit 0, all GL errors 0, no GPU faults/resets.
+  Steps 1-4 as on xnu92 (clear 1.90 ms, triangle 1.84 ms, 100 frames 1.114
+  ms). Context took 11.8 s this time: IO lock waits during boot (`IO slow
+  gl_test ... 3030 ms waiting for the lock`), not the GPU.
+  Texture make + 8.3 MB upload 116.8 ms. Per frame (shortest / mean, ms):
+  | kind                          | min    | mean   |
+  | clear only                    |   7.50 |   7.71 |
+  | one small rectangle, no clear |   9.07 |   9.32 |
+  | clear + 1 rectangle           |  13.24 |  13.40 |
+  | clear + 2 rectangles          |  13.74 |  13.88 |
+  | clear + 4 rectangles          |  16.28 |  16.49 |
+  | clear + 8 rectangles          |  28.89 |  29.10 |
+  | clear + 1 textured blended    |  23.55 |  23.93 |
+  | clear + 2 textured blended    |  46.21 |  46.80 |
+  | clear + 4 textured blended    |  91.27 |  91.48 |
+  | clear + 8 textured blended    | 182.19 | 182.34 |
+  Middle pixel after the last kind: bytes af 75 47 ff (drawn, not the clear).
+- [I] A full-screen clear is ~7.7 ms (~270 Mpixel/s); flat full-screen
+  layers are cheap (~2-3 ms each); a textured+blended full-screen layer costs
+  ~23 ms (linear, ~90 Mpixel/s), so 60 Hz holds a clear + ~1 flat layer but
+  not one textured layer. The small-rectangle frame (9 ms) shows ~9 ms fixed
+  cost per submitted frame at this size (tiler/fragment job setup + wait).
+- [G] Why textured is slow: the source texture is probably linear (not
+  u-interleaved/AFBC) after a CPU upload, and/or the GPU runs at a low DVFS
+  step (no G3D clock control on the J7 side yet). To check next: Mesa's
+  modifier choice for the texture (PAN_MESA_DEBUG), the G3D clock, and
+  whether ~9 ms fixed cost is HakiosMali's submit/wait path (IRQ latency).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
