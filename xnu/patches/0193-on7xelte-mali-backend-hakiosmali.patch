@@ -1,0 +1,1135 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,7 @@
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>     /* 0191 */
++#include <IOKit/IOPlatformExpert.h>            /* 0193 */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -644,6 +645,7 @@
+ static volatile uint32_t on7_mali_irq_n[3];     /* GPU, JOB, MMU */
+ static volatile uint32_t on7_mali_irq_st[3];    /* OR of every status seen */
+ static volatile uint32_t on7_mali_irq_spurious;
++static uint32_t on7_mali_irq_acc[3];            /* 0193: status bits not yet taken by the job worker */
+ 
+ extern "C" int
+ on7_mali_irq(uint32_t intid)
+@@ -662,6 +664,7 @@
+ 	gpu[(b + (k == 0 ? 0x24 : 0x04)) / 4] = st;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	on7_mali_irq_st[k] |= st;
++	__atomic_fetch_or(&on7_mali_irq_acc[k], st, __ATOMIC_RELAXED);
+ 	on7_mali_irq_n[k]++;
+ 	thread_wakeup_prim((event_t)&on7_mali_irq_n[k], FALSE, THREAD_AWAKENED);
+ 	return 1;
+@@ -857,6 +860,8 @@
+ 	on7_mali_gic_log("after test");
+ }
+ 
++static void on7_mali_backend(volatile uint32_t *gpu, int step);
++
+ static void
+ on7_mali_steps(volatile uint32_t *gpu)
+ {
+@@ -936,6 +941,9 @@
+ 		return;
+ 	}
+ 	on7_mali_job_test(gpu, step);
++	if (step >= 8) {
++		on7_mali_backend(gpu, step);
++	}
+ }
+ 
+ static void
+@@ -1012,6 +1020,1089 @@
+ 		thread_deallocate(th);
+ 	}
+ }
++
++/*
++ * 0193: GPU step 5, a backend for programs plus the a50 port's HakiosMali
++ * user client (ios-a50-exynos9610 core/drivers/gpu/hakios.mali.cpp, APSL 2.0,
++ * from hakios-mt6768 RedwoodMali), on7malistep 8 and 9.
++ *   - page tables: Mali LPAE as 0191, from a pool of physically contiguous
++ *     wired pages (tables are taken from it as needed and kept); GPU pages
++ *     are 4 KB, the kernel's 16 KB pages are entered as four of them.
++ *   - GPU addresses: the a50's allocator (hakios.mali_va.h): 32 MB..4 GB in
++ *     64 KB granules plus one empty granule after each buffer, executable
++ *     buffers do not cross a 16 MB line.
++ *   - after a table change: AS0 LOCKADDR (whole 4 GB) + LOCK + FLUSH_PT, as
++ *     Linux panfrost's mmu_hw_do_operation (not UPDATE: jobs may run).
++ *   - jobs: a queue and one worker thread (as the a50); fragment chains on
++ *     JS0, the rest on JS1, AS0, start/end flush clean+invalidate; the worker
++ *     sleeps until the JOB interrupt (0192) says done/failed for the slot,
++ *     1 s at most (boot-arg on7malitimeout ms). A failed or timed-out chain
++ *     is logged (JS_STATUS, MMU fault) and the GPU soft-reset and brought
++ *     up again (quirks, power, AS0, interrupt masks).
++ *   - T830 quirk [G]: L2_MMU_CONFIG external read/write limits cleared
++ *     (panfrost_gpu_init_quirks does it for every Midgard). Linux panfrost's
++ *     T830 issue list is not checked here; nothing else is set.
++ * Step 8 then tests the backend from the kernel (parameters, a buffer as
++ * programs get them, a WRITE_VALUE chain through the queue, 200 chains in a
++ * row) and starts the HakiosMali service (IOServiceMatching("HakiosMali"),
++ * same selectors and structures as the a50, without its IOSurface requests
++ * 0x7c/0x7e/0x7f). Step 9 also runs a chain from an unmapped address first
++ * (MMU fault expected) to test the recovery.
++ */
++extern "C" kern_return_t clear_wait(thread_t thread, wait_result_t result);
++extern "C" thread_t current_thread(void);
++
++#define MALI_GPU_ID             0x000
++#define MALI_L2_MMU_CONFIG      0xf0c
++#define MALI_CMD_HARD_RESET     0x02
++#define MALI_AS_LOCKADDR_LO     0x10
++#define MALI_AS_LOCKADDR_HI     0x14
++#define MALI_AS_CMD_LOCK        0x02
++#define MALI_AS_CMD_FLUSH_PT    0x04
++#define MALI_JS0                0x1800
++
++#define ON7_POOL_PAGES          512     /* 2 MB of page tables: up to 1 GB mapped */
++#define MALI_VA_FIRST           0x02000000ull
++#define MALI_VA_END             0x100000000ull
++#define MALI_VA_GRANULE         0x10000ull
++#define MALI_VA_GRANULES        (MALI_VA_END / MALI_VA_GRANULE)
++#define MALI_VA_EXEC_LINE       0x1000000ull
++
++static IOLock *on7_mali_lock;           /* page tables, AS0 and job slot registers */
++static IOBufferMemoryDescriptor *on7_pool_mem;
++static uint8_t *on7_pool_va;
++static uint64_t on7_pool_pa;
++static uint32_t on7_pool_pages, on7_pool_used = 1;     /* page 0 = L0 */
++static uint64_t on7_pool_dirty_lo = ~0ull, on7_pool_dirty_hi;
++static uint64_t on7_mali_transtab;
++static uint32_t on7_mali_shader, on7_mali_tiler, on7_mali_l2;
++static bool on7_mali_ok;
++static uint32_t on7_mali_timeout_ms = 1000;
++static uint32_t on7_mali_resets, on7_mali_failed, on7_mali_jobs;
++static uint32_t on7_mali_pt_fail;
++
++static struct {
++	uint64_t used[MALI_VA_GRANULES / 64];
++	uint64_t next, taken;
++} on7_va;
++
++static bool
++on7_va_used(uint64_t g)
++{
++	return (on7_va.used[g / 64] >> (g % 64)) & 1;
++}
++
++static void
++on7_va_mark(uint64_t first, uint64_t count, bool used)
++{
++	for (uint64_t g = first; g < first + count; g++) {
++		if (used) {
++			on7_va.used[g / 64] |= 1ull << (g % 64);
++		} else {
++			on7_va.used[g / 64] &= ~(1ull << (g % 64));
++		}
++	}
++	on7_va.taken = used ? on7_va.taken + count : on7_va.taken - count;
++}
++
++static uint64_t
++on7_va_granules(uint64_t size)
++{
++	return (size + MALI_VA_GRANULE - 1) / MALI_VA_GRANULE + 1;
++}
++
++static uint64_t
++on7_va_find(uint64_t from, uint64_t count, uint64_t size, bool executable)
++{
++	uint64_t g = from;
++
++	while (g + count <= MALI_VA_GRANULES) {
++		uint64_t start = g * MALI_VA_GRANULE, run = 0;
++
++		if (executable && size <= MALI_VA_EXEC_LINE &&
++		    start / MALI_VA_EXEC_LINE != (start + size - 1) / MALI_VA_EXEC_LINE) {
++			g = (start / MALI_VA_EXEC_LINE + 1) * (MALI_VA_EXEC_LINE / MALI_VA_GRANULE);
++			continue;
++		}
++		while (run < count && !on7_va_used(g + run)) {
++			run++;
++		}
++		if (run == count) {
++			return g;
++		}
++		g += run + 1;
++	}
++	return 0;
++}
++
++/* ---- page tables (on7_mali_lock held) ---- */
++
++static uint64_t *
++on7_pool_table(uint64_t pa)
++{
++	return (uint64_t *)(on7_pool_va + (pa - on7_pool_pa));
++}
++
++static void
++on7_pool_dirty(uint64_t *entry)
++{
++	uint64_t pa = on7_pool_pa + (uint64_t)((uint8_t *)entry - on7_pool_va);
++	if (pa < on7_pool_dirty_lo) {
++		on7_pool_dirty_lo = pa;
++	}
++	if (pa + 8 > on7_pool_dirty_hi) {
++		on7_pool_dirty_hi = pa + 8;
++	}
++}
++
++/* the next level's table for entry `e`, made when `make`; NULL: none (or the pool is used up) */
++static uint64_t *
++on7_pt_next(uint64_t *e, bool make)
++{
++	if ((*e & 3) == 3) {
++		return on7_pool_table(*e & 0x000000fffffff000ull);
++	}
++	if (!make || on7_pool_used >= on7_pool_pages) {
++		if (make) {
++			on7_mali_pt_fail++;
++		}
++		return NULL;
++	}
++	uint64_t pa = on7_pool_pa + (uint64_t)on7_pool_used++ * 4096;
++	*e = pa | ON7_PTE_TABLE;
++	on7_pool_dirty(e);
++	if (pa < on7_pool_dirty_lo) {
++		on7_pool_dirty_lo = pa;
++	}
++	if (pa + 4096 > on7_pool_dirty_hi) {
++		on7_pool_dirty_hi = pa + 4096;
++	}
++	return on7_pool_table(pa);
++}
++
++static uint64_t *
++on7_pt_leaf(uint64_t va, bool make)
++{
++	uint64_t *t = on7_pool_table(on7_pool_pa);
++	t = on7_pt_next(&t[(va >> 39) & 511], make);
++	if (t != NULL) {
++		t = on7_pt_next(&t[(va >> 30) & 511], make);
++	}
++	if (t != NULL) {
++		t = on7_pt_next(&t[(va >> 21) & 511], make);
++	}
++	return t != NULL ? &t[(va >> 12) & 511] : NULL;
++}
++
++static void
++on7_pt_flush_cpu(void)
++{
++	if (on7_pool_dirty_hi > on7_pool_dirty_lo) {
++		uint64_t lo = on7_pool_dirty_lo & ~63ull, hi = (on7_pool_dirty_hi + 63) & ~63ull;
++		flush_dcache64((addr64_t)lo, (unsigned)(hi - lo), TRUE);
++	}
++	on7_pool_dirty_lo = ~0ull;
++	on7_pool_dirty_hi = 0;
++}
++
++static uint32_t
++on7_as_wait(volatile uint32_t *gpu)
++{
++	return on7_poll(gpu, MALI_AS0 + MALI_AS_STATUS, 1, 0);
++}
++
++/* the GPU's TLBs and walk caches after a table change: LOCK all 4 GB, FLUSH_PT */
++static void
++on7_as_flush(volatile uint32_t *gpu)
++{
++	on7_pt_flush_cpu();
++	uint32_t a = on7_as_wait(gpu);
++	on7_wr(gpu, MALI_AS0 + MALI_AS_LOCKADDR_LO, 31);        /* region 2^(31+1) from 0 */
++	on7_wr(gpu, MALI_AS0 + MALI_AS_LOCKADDR_HI, 0);
++	on7_wr(gpu, MALI_AS0 + MALI_AS_COMMAND, MALI_AS_CMD_LOCK);
++	uint32_t b = on7_as_wait(gpu);
++	on7_wr(gpu, MALI_AS0 + MALI_AS_COMMAND, MALI_AS_CMD_FLUSH_PT);
++	uint32_t c = on7_as_wait(gpu);
++	if (a == ~0u || b == ~0u || c == ~0u) {
++		IOLog("ON7 MALI: AS0 flush TIMEOUT (%u %u %u) as_status %08x\n", a, b, c,
++		    on7_rd(gpu, MALI_AS0 + MALI_AS_STATUS));
++	}
++}
++
++/*
++ * Reset and bring up: masks off, soft reset (hard reset when that does not
++ * finish), quirks, L2 / tiler / shader power, AS0 tables, interrupt masks.
++ * on7_mali_lock held (or nothing else running yet).
++ */
++static bool
++on7_mali_hw_up(volatile uint32_t *gpu, bool say)
++{
++	on7_wr(gpu, MALI_GPU_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_JOB_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_MMU_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_SOFT_RESET);
++	uint32_t n = on7_poll(gpu, MALI_GPU_IRQ_RAWSTAT, MALI_IRQ_RESET_DONE, MALI_IRQ_RESET_DONE);
++	if (n == ~0u) {
++		IOLog("ON7 MALI: soft reset TIMEOUT, hard reset\n");
++		on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_HARD_RESET);
++		n = on7_poll(gpu, MALI_GPU_IRQ_RAWSTAT, MALI_IRQ_RESET_DONE, MALI_IRQ_RESET_DONE);
++		if (n == ~0u) {
++			IOLog("ON7 MALI: hard reset TIMEOUT, GPU left off\n");
++			return false;
++		}
++	}
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_JOB_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_MMU_IRQ_CLEAR, 0xffffffffu);
++	uint32_t q0 = on7_rd(gpu, MALI_L2_MMU_CONFIG);
++	on7_wr(gpu, MALI_L2_MMU_CONFIG, q0 & ~((3u << 24) | (3u << 26)));
++	if (say) {
++		IOLog("ON7 MALI: quirk [G] L2_MMU_CONFIG %08x -> %08x (external read/write limits off)\n",
++		    q0, on7_rd(gpu, MALI_L2_MMU_CONFIG));
++	}
++	on7_wr(gpu, MALI_L2_PWRON, on7_mali_l2);
++	uint32_t a = on7_poll(gpu, MALI_L2_READY, on7_mali_l2, on7_mali_l2);
++	on7_wr(gpu, MALI_TILER_PWRON, on7_mali_tiler);
++	on7_wr(gpu, MALI_SHADER_PWRON, on7_mali_shader);
++	uint32_t b = on7_poll(gpu, MALI_SHADER_READY, on7_mali_shader, on7_mali_shader);
++	uint32_t c = on7_poll(gpu, MALI_TILER_READY, on7_mali_tiler, on7_mali_tiler);
++	volatile uint32_t *as = gpu + MALI_AS0 / 4;
++	as[MALI_AS_TRANSTAB_LO / 4] = (uint32_t)on7_mali_transtab;
++	as[MALI_AS_TRANSTAB_HI / 4] = (uint32_t)(on7_mali_transtab >> 32);
++	as[MALI_AS_MEMATTR_LO / 4] = 0x888d88u;
++	as[MALI_AS_MEMATTR_HI / 4] = 0;
++	on7_wr(gpu, MALI_AS0 + MALI_AS_COMMAND, MALI_AS_CMD_UPDATE);
++	uint32_t d = on7_as_wait(gpu);
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_GPU_IRQ_MASK, 1u | (1u << 7) | MALI_IRQ_CLEAN_DONE);
++	on7_wr(gpu, MALI_JOB_IRQ_MASK, 0x00070007u);
++	on7_wr(gpu, MALI_MMU_IRQ_MASK, 0x00ff00ffu);
++	/* the cycle counter and timestamp stop at a reset: WRITE_VALUE types 1/2 then write 0 (seen) */
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_CYCLE_START);
++	if (say || a == ~0u || b == ~0u || c == ~0u || d == ~0u) {
++		IOLog("ON7 MALI: up: reset %u, L2 %u shader %u tiler %u polls, AS0 %u; transtab %08x%08x status %08x\n",
++		    n, a, b, c, d, on7_rd(gpu, MALI_AS0 + MALI_AS_TRANSTAB_HI),
++		    on7_rd(gpu, MALI_AS0 + MALI_AS_TRANSTAB_LO), on7_rd(gpu, MALI_GPU_STATUS));
++	}
++	return a != ~0u && b != ~0u && c != ~0u && d != ~0u;
++}
++
++/* ---- the backend, with the a50's names (hakios.mali.c) ---- */
++
++static bool
++hakios_mali_ready(void)
++{
++	return on7_mali_ok;
++}
++
++static bool
++hakios_mali_parameter(uint32_t which, uint64_t *value)
++{
++	volatile uint32_t *gpu = on7_gpu_regs;
++	static const uint16_t simple[] = {
++		[5] = 0xe00, [6] = 0x018, [7] = 0x01c, [8] = 0x004, [9] = 0x008, [10] = 0x00c,
++		[11] = 0x010, [12] = 0x014, [13] = 0x0ac, [14] = 0x0a0, [15] = 0x0a4, [16] = 0x0a8,
++		[17] = 0x300, [18] = 0x0b0, [19] = 0x0b4, [20] = 0x0b8, [21] = 0x0bc,
++	};
++
++	if (gpu == NULL) {
++		return false;
++	}
++	switch (which) {
++	case 0:
++		*value = on7_rd(gpu, MALI_GPU_ID) >> 16;
++		return true;
++	case 1:
++		*value = on7_rd(gpu, MALI_GPU_ID) & 0xffff;
++		return true;
++	case 2: case 3: case 4: {
++		uint32_t r = which == 2 ? MALI_SHADER_PRESENT : which == 3 ? MALI_TILER_PRESENT : MALI_L2_PRESENT;
++		*value = on7_rd(gpu, r) | ((uint64_t)on7_rd(gpu, r + 4) << 32);
++		return true;
++	}
++	case 38: {
++		uint32_t l2 = on7_rd(gpu, MALI_L2_PRESENT);
++		*value = l2 ? (uint64_t)__builtin_popcount(l2) : 1;
++		return true;
++	}
++	case 39: {
++		uint32_t tls = on7_rd(gpu, 0x310), mx = on7_rd(gpu, 0x0a0);
++		*value = tls > mx ? tls : mx;
++		return true;
++	}
++	case 40:
++		*value = 0;
++		return true;
++	default:
++		if (which >= 22 && which <= 37) {
++			*value = on7_rd(gpu, 0x0c0 + 4 * (which - 22));
++			return true;
++		}
++		if (which < sizeof(simple) / sizeof(simple[0]) && simple[which] != 0) {
++			*value = on7_rd(gpu, simple[which]);
++			return true;
++		}
++		return false;
++	}
++}
++
++static uint64_t
++hakios_mali_address(uint64_t size, bool executable)
++{
++	uint64_t count = on7_va_granules(size), first = MALI_VA_FIRST / MALI_VA_GRANULE, g = 0;
++
++	if (size == 0 || size > MALI_VA_END - MALI_VA_FIRST) {
++		return 0;
++	}
++	IOLockLock(on7_mali_lock);
++	if (on7_va.next > first) {
++		g = on7_va_find(on7_va.next, count, size, executable);
++	}
++	if (g == 0) {
++		g = on7_va_find(first, count, size, executable);
++	}
++	if (g != 0) {
++		on7_va_mark(g, count, true);
++		on7_va.next = g + count < MALI_VA_GRANULES ? g + count : first;
++	}
++	IOLockUnlock(on7_mali_lock);
++	return g * MALI_VA_GRANULE;
++}
++
++static bool
++hakios_mali_map(uint64_t gpu_va, uint64_t phys)
++{
++	if ((gpu_va & 0xfff) != 0 || (phys & 0xfff) != 0 || gpu_va >= MALI_VA_END || phys >= (1ull << 40)) {
++		return false;
++	}
++	IOLockLock(on7_mali_lock);
++	uint64_t *e = on7_pt_leaf(gpu_va, true);
++	if (e != NULL) {
++		*e = phys | ON7_PTE_LEAF;
++		on7_pool_dirty(e);
++	}
++	IOLockUnlock(on7_mali_lock);
++	/* nothing of this page left in the CPU's caches to land on the GPU's data later */
++	flush_dcache64((addr64_t)phys, 4096, TRUE);
++	return e != NULL;
++}
++
++static void
++hakios_mali_mapped(void)
++{
++	IOLockLock(on7_mali_lock);
++	on7_as_flush(on7_gpu_regs);
++	IOLockUnlock(on7_mali_lock);
++}
++
++static void
++hakios_mali_unmap(uint64_t gpu_va, uint64_t size)
++{
++	IOLockLock(on7_mali_lock);
++	for (uint64_t o = 0; o < size; o += 4096) {
++		uint64_t *e = on7_pt_leaf(gpu_va + o, false);
++		if (e != NULL && *e != 0) {
++			*e = 0;
++			on7_pool_dirty(e);
++		}
++	}
++	on7_as_flush(on7_gpu_regs);
++	uint64_t g = gpu_va / MALI_VA_GRANULE, count = on7_va_granules(size);
++	bool ours = gpu_va >= MALI_VA_FIRST && gpu_va % MALI_VA_GRANULE == 0 && size != 0 && g + count <= MALI_VA_GRANULES;
++	for (uint64_t k = g; ours && k < g + count; k++) {
++		ours = on7_va_used(k);
++	}
++	if (ours) {
++		on7_va_mark(g, count, false);
++	}
++	IOLockUnlock(on7_mali_lock);
++}
++
++/* one chain, run to its end: 0 done, else the slot's JS_STATUS (0xff: timeout) */
++static uint32_t
++hakios_mali_submit(uint64_t chain, bool fragment)
++{
++	volatile uint32_t *gpu = on7_gpu_regs;
++	uint32_t slot = fragment ? 0 : 1, js = MALI_JS0 + slot * 0x80;
++	uint32_t done = 1u << slot, fail = 1u << (slot + 16), bits = 0;
++	uint64_t deadline, now;
++
++	__atomic_fetch_and(&on7_mali_irq_acc[1], ~(done | fail), __ATOMIC_RELAXED);
++	IOLockLock(on7_mali_lock);
++	on7_wr(gpu, js + MALI_JS_HEAD_NEXT_LO, (uint32_t)chain);
++	on7_wr(gpu, js + MALI_JS_HEAD_NEXT_HI, (uint32_t)(chain >> 32));
++	on7_wr(gpu, js + MALI_JS_AFFINITY_NEXT_LO, on7_mali_shader);
++	on7_wr(gpu, js + MALI_JS_AFFINITY_NEXT_HI, 0);
++	on7_wr(gpu, js + MALI_JS_CONFIG_NEXT, 0 | MALI_JS_CFG_START_FLUSH | MALI_JS_CFG_END_FLUSH | MALI_JS_CFG_PRI(8));
++	on7_wr(gpu, js + MALI_JS_COMMAND_NEXT, MALI_JS_CMD_START);
++	IOLockUnlock(on7_mali_lock);
++	clock_interval_to_deadline(on7_mali_timeout_ms, kMillisecondScale, &deadline);
++	for (;;) {
++		bits = __atomic_load_n(&on7_mali_irq_acc[1], __ATOMIC_RELAXED) & (done | fail);
++		now = mach_absolute_time();
++		if (bits != 0 || now >= deadline) {
++			break;
++		}
++		/* 10 ms slices: an interrupt between the look and the wait costs at most one */
++		assert_wait_timeout((event_t)&on7_mali_irq_n[1], THREAD_UNINT, 10, 1000 * 1000);
++		if (__atomic_load_n(&on7_mali_irq_acc[1], __ATOMIC_RELAXED) & (done | fail)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++	}
++	on7_mali_jobs++;
++	if (bits == done) {
++		return 0;
++	}
++	IOLockLock(on7_mali_lock);
++	uint32_t status = bits & fail ? on7_rd(gpu, js + MALI_JS_STATUS) : 0xff;
++	on7_mali_failed++;
++	IOLog("ON7 MALI: chain %llx on slot %u %s: js_status %08x head %08x%08x job_raw %08x; MMU irqs %u seen %08x "
++	    "as0 fault %08x at %08x%08x; GPU seen %08x fault %08x -> reset\n",
++	    chain, slot, bits & fail ? "FAILED" : "TIMED OUT", on7_rd(gpu, js + MALI_JS_STATUS),
++	    on7_rd(gpu, js + MALI_JS_HEAD_HI), on7_rd(gpu, js + MALI_JS_HEAD_LO), on7_rd(gpu, MALI_JOB_IRQ_RAWSTAT),
++	    on7_mali_irq_n[2], __atomic_exchange_n(&on7_mali_irq_acc[2], 0, __ATOMIC_RELAXED),
++	    on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTSTATUS), on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTADDR_HI),
++	    on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTADDR_LO), __atomic_exchange_n(&on7_mali_irq_acc[0], 0, __ATOMIC_RELAXED),
++	    on7_rd(gpu, MALI_GPU_FAULTSTATUS));
++	on7_mali_resets++;
++	if (!on7_mali_hw_up(gpu, false)) {
++		on7_mali_ok = false;
++	}
++	__atomic_fetch_and(&on7_mali_irq_acc[1], ~(done | fail), __ATOMIC_RELAXED);
++	IOLockUnlock(on7_mali_lock);
++	return status;
++}
++
++#define ON7_QUEUE               64
++static struct {
++	uint64_t chain, seq;
++	bool fragment;
++} on7_queue[ON7_QUEUE];
++static unsigned on7_queue_head, on7_queue_count;
++static uint64_t on7_queued_seq, on7_done_seq;
++static IOLock *on7_queue_lock;
++
++static void
++on7_mali_worker(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	for (;;) {
++		IOLockLock(on7_queue_lock);
++		while (on7_queue_count == 0) {
++			IOLockSleep(on7_queue_lock, &on7_queue_count, THREAD_UNINT);
++		}
++		uint64_t chain = on7_queue[on7_queue_head].chain, seq = on7_queue[on7_queue_head].seq;
++		bool fragment = on7_queue[on7_queue_head].fragment;
++		IOLockUnlock(on7_queue_lock);
++
++		if (on7_mali_ok) {
++			(void)hakios_mali_submit(chain, fragment);
++		}
++
++		IOLockLock(on7_queue_lock);
++		on7_queue_head = (on7_queue_head + 1) % ON7_QUEUE;
++		on7_queue_count--;
++		on7_done_seq = seq;
++		IOLockWakeup(on7_queue_lock, &on7_done_seq, false);
++		IOLockWakeup(on7_queue_lock, &on7_queue_head, false);
++		IOLockUnlock(on7_queue_lock);
++	}
++}
++
++static uint64_t
++hakios_mali_enqueue(uint64_t chain, bool fragment)
++{
++	uint64_t seq;
++
++	IOLockLock(on7_queue_lock);
++	while (on7_queue_count == ON7_QUEUE) {
++		IOLockSleep(on7_queue_lock, &on7_queue_head, THREAD_UNINT);
++	}
++	seq = ++on7_queued_seq;
++	unsigned at = (on7_queue_head + on7_queue_count) % ON7_QUEUE;
++	on7_queue[at].chain = chain;
++	on7_queue[at].fragment = fragment;
++	on7_queue[at].seq = seq;
++	on7_queue_count++;
++	IOLockWakeup(on7_queue_lock, &on7_queue_count, false);
++	IOLockUnlock(on7_queue_lock);
++	return seq;
++}
++
++static bool
++hakios_mali_wait(uint64_t seq, uint64_t timeout_ns)
++{
++	uint64_t deadline;
++	bool done;
++
++	if (timeout_ns > 10ull * NSEC_PER_SEC) {
++		timeout_ns = 10ull * NSEC_PER_SEC;
++	}
++	nanoseconds_to_absolutetime(timeout_ns, &deadline);
++	deadline += mach_absolute_time();
++	IOLockLock(on7_queue_lock);
++	while (on7_done_seq < seq && timeout_ns != 0 && mach_absolute_time() < deadline) {
++		IOLockSleepDeadline(on7_queue_lock, &on7_done_seq, deadline, THREAD_UNINT);
++	}
++	done = on7_done_seq >= seq;
++	IOLockUnlock(on7_queue_lock);
++	return done;
++}
++
++/* ---- HakiosMali (a50 hakios.mali.cpp, trimmed: no IOSurface requests) ---- */
++
++enum {
++	kDrmGemClose            = 0x09,
++	kPanfrostSubmit         = 0x40,
++	kPanfrostWaitBO         = 0x41,
++	kPanfrostCreateBO       = 0x42,
++	kPanfrostMmapBO         = 0x43,
++	kPanfrostGetParam       = 0x44,
++	kPanfrostGetBOOffset    = 0x45,
++	kPanfrostMadvise        = 0x48,
++	kHakiosMaliWait         = 0x7d,
++};
++
++struct mali_wait {
++	uint64_t seq;
++	int64_t timeout_ns;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct drm_panfrost_submit {
++	uint64_t jc;
++	uint64_t in_syncs;
++	uint32_t in_sync_count;
++	uint32_t out_sync;
++	uint64_t bo_handles;
++	uint32_t bo_handle_count;
++	uint32_t requirements;
++};
++#define PANFROST_JD_REQ_FS      (1u << 0)
++struct drm_panfrost_wait_bo {
++	uint32_t handle, pad;
++	int64_t timeout_ns;
++};
++struct drm_panfrost_create_bo {
++	uint32_t size, flags, handle, pad;
++	uint64_t offset;
++};
++#define PANFROST_BO_NOEXEC      (1u << 0)
++#define PANFROST_BO_HEAP        (1u << 1)
++struct drm_panfrost_mmap_bo {
++	uint32_t handle, flags;
++	uint64_t offset;
++};
++struct drm_panfrost_get_param {
++	uint32_t param, pad;
++	uint64_t value;
++};
++struct drm_panfrost_get_bo_offset {
++	uint32_t handle, pad;
++	uint64_t offset;
++};
++struct drm_panfrost_madvise {
++	uint32_t handle, madv, retained;
++};
++
++#define MALI_BUFFERS            4096
++#define MALI_BUFFER_MAX         (256ull << 20)
++
++struct mali_buffer {
++	IOBufferMemoryDescriptor *memory;
++	uint64_t address, size;
++	uint64_t last_seq;
++};
++
++static IOLock *gMaliLock;
++static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits;
++
++/* a wired, write-combined buffer entered into the GPU's addresses: what createBO gives programs */
++static IOBufferMemoryDescriptor *
++on7_mali_buffer(uint64_t size, uint32_t flags, uint64_t *address)
++{
++	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, (vm_size_t)size, PAGE_SIZE);
++	bool mapped = true;
++
++	*address = 0;
++	if (memory == NULL) {
++		IOLog("ON7 MALI: no memory for a buffer of %llu bytes\n", size);
++		return NULL;
++	}
++	bzero(memory->getBytesNoCopy(), (size_t)size);
++	uint64_t a = hakios_mali_address(size, !(flags & PANFROST_BO_NOEXEC));
++	for (uint64_t o = 0; o < size && mapped && a != 0; o += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(o, &length, kIOMemoryMapperNone);
++		mapped = phys != 0 && hakios_mali_map(a + o, phys);
++	}
++	if (a == 0 || !mapped) {
++		if (a != 0) {
++			hakios_mali_unmap(a, size);
++		}
++		memory->release();
++		IOLog("ON7 MALI: a buffer of %llu bytes cannot be entered into the GPU's addresses (pt pool %u/%u)\n",
++		    size, on7_pool_used, on7_pool_pages);
++		return NULL;
++	}
++	hakios_mali_mapped();
++	OSIncrementAtomic((SInt32 *)&gMaliBuffers);
++	*address = a;
++	return memory;
++}
++
++class HakiosMali : public IOService
++{
++	OSDeclareDefaultStructors(HakiosMali);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HakiosMali, IOService);
++
++bool
++HakiosMali::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "HakiosMaliUserClient");
++	setName("HakiosMali");
++	registerService();
++	return true;
++}
++
++static void
++HakiosMaliStart(void)
++{
++	IOService *provider = IOService::getPlatform();
++	HakiosMali *gpu;
++
++	gMaliLock = IOLockAlloc();
++	gpu = OSTypeAlloc(HakiosMali);
++	if (gpu == NULL || gMaliLock == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("ON7 MALI: HakiosMali cannot be created\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("ON7 MALI: HakiosMali did not start\n");
++		gpu->release();
++		return;
++	}
++	gpu->release();
++	IOLog("ON7 MALI: HakiosMali registered: the GPU is there for programs\n");
++}
++
++class HakiosMaliUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(HakiosMaliUserClient);
++
++	struct mali_buffer *fBuffers;
++	uint32_t fNextBuffer, fSubmits, fRequests;
++
++	struct mali_buffer *buffer(uint32_t handle);
++	void freeBuffer(struct mali_buffer *b);
++	IOReturn createBO(struct drm_panfrost_create_bo *request);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HakiosMaliUserClient, IOUserClient);
++
++bool
++HakiosMaliUserClient::start(IOService *provider)
++{
++	if (!hakios_mali_ready() || !IOUserClient::start(provider)) {
++		IOLog("ON7 MALI: a client could not be started\n");
++		return false;
++	}
++	OSIncrementAtomic((SInt32 *)&gMaliClients);
++	IOLog("ON7 MALI: client %u opened the GPU (pid %d)\n", gMaliClients, proc_selfpid());
++	fBuffers = IONewZero(struct mali_buffer, MALI_BUFFERS);
++	return fBuffers != NULL;
++}
++
++struct mali_buffer *
++HakiosMaliUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > MALI_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++void
++HakiosMaliUserClient::freeBuffer(struct mali_buffer *b)
++{
++	if (b->last_seq != 0) {
++		(void)hakios_mali_wait(b->last_seq, 2ull * NSEC_PER_SEC);
++	}
++	hakios_mali_unmap(b->address, b->size);
++	b->memory->release();
++	bzero(b, sizeof(*b));
++}
++
++IOReturn
++HakiosMaliUserClient::createBO(struct drm_panfrost_create_bo *request)
++{
++	uint64_t size = round_page_64(request->size), address;
++	struct mali_buffer *b = NULL;
++
++	if (size == 0 || size > MALI_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		return kIOReturnNoResources;
++	}
++	IOBufferMemoryDescriptor *memory = on7_mali_buffer(size, request->flags, &address);
++	if (memory == NULL) {
++		return kIOReturnNoMemory;
++	}
++	b->memory = memory;
++	b->address = address;
++	b->size = size;
++	request->offset = address;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++HakiosMaliUserClient::clientClose(void)
++{
++	IOLockLock(gMaliLock);
++	for (uint32_t i = 0; fBuffers != NULL && i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL) {
++			freeBuffer(&fBuffers[i]);
++		}
++	}
++	IOLockUnlock(gMaliLock);
++	IOLog("ON7 MALI: a client goes after %u job chains\n", fSubmits);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++HakiosMaliUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct mali_buffer, MALI_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++IOReturn
++HakiosMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	struct mali_buffer *b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gMaliLock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gMaliLock);
++	return ret;
++}
++
++IOReturn
++HakiosMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	union {
++		struct drm_gem_close close;
++		struct drm_panfrost_submit submit;
++		struct drm_panfrost_wait_bo wait;
++		struct drm_panfrost_create_bo create;
++		struct drm_panfrost_mmap_bo mmap;
++		struct drm_panfrost_get_param param;
++		struct drm_panfrost_get_bo_offset offset;
++		struct drm_panfrost_madvise madvise;
++		struct mali_wait waitseq;
++	} r;
++	size_t size = args->structureInputSize;
++	struct mali_buffer *b;
++	IOReturn ret = kIOReturnSuccess;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!hakios_mali_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	if (selector == kHakiosMaliWait || selector == kPanfrostWaitBO) {
++		uint64_t seq = r.waitseq.seq;
++		int64_t timeout = r.waitseq.timeout_ns;
++
++		if (selector == kPanfrostWaitBO) {
++			IOLockLock(gMaliLock);
++			b = buffer(r.wait.handle);
++			seq = b != NULL ? b->last_seq : 0;
++			IOLockUnlock(gMaliLock);
++			timeout = r.wait.timeout_ns;
++			if (b == NULL) {
++				return kIOReturnNotFound;
++			}
++		}
++		ret = seq == 0 || hakios_mali_wait(seq, timeout > 0 ? (uint64_t)timeout : 0) ? kIOReturnSuccess : kIOReturnTimeout;
++		if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++			memcpy(args->structureOutput, &r, size);
++			args->structureOutputSize = (uint32_t)size;
++		}
++		return ret;
++	}
++	IOLockLock(gMaliLock);
++	if (fRequests++ < 32) {
++		IOLog("ON7 MALI: request %#x, %zu bytes\n", selector, size);
++	}
++	switch (selector) {
++	case kPanfrostGetParam:
++		if (!hakios_mali_parameter(r.param.param, &r.param.value)) {
++			ret = kIOReturnBadArgument;
++		}
++		break;
++	case kPanfrostCreateBO:
++		ret = createBO(&r.create);
++		break;
++	case kPanfrostMmapBO:
++		ret = buffer(r.mmap.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.mmap.offset = (uint64_t)r.mmap.handle << 12;
++		break;
++	case kPanfrostGetBOOffset:
++		b = buffer(r.offset.handle);
++		ret = b != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		r.offset.offset = b != NULL ? b->address : 0;
++		break;
++	case kPanfrostSubmit: {
++		uint64_t seq = 0;
++
++		fSubmits++;
++		gMaliSubmits++;
++		if (r.submit.jc != 0) {
++			seq = hakios_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
++		}
++		for (uint32_t i = 0; seq != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
++			uint32_t handles[64];
++			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++			if (copyin((user_addr_t)(r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++				break;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				b = buffer(handles[k]);
++				if (b != NULL) {
++					b->last_seq = seq;
++				}
++			}
++		}
++		r.submit.jc = seq;
++		break;
++	}
++	case kPanfrostWaitBO:
++		ret = buffer(r.wait.handle) != NULL ? kIOReturnSuccess : kIOReturnNotFound;
++		break;
++	case kPanfrostMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kDrmGemClose:
++		b = buffer(r.close.handle);
++		if (b != NULL) {
++			freeBuffer(b);
++		} else {
++			ret = kIOReturnNotFound;
++		}
++		break;
++	default:
++		IOLog("ON7 MALI: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	IOLockUnlock(gMaliLock);
++
++	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
++		memcpy(args->structureOutput, &r, size);
++		args->structureOutputSize = (uint32_t)size;
++	}
++	return ret;
++}
++
++/* ---- step 8/9: bring the backend up and test it from the kernel ---- */
++
++/* two WRITE_VALUE jobs (0191) at kernel address k / GPU address g, writing to GPU address t */
++static void
++on7_mali_write_chain(uint32_t *k, uint64_t g, uint64_t t)
++{
++	bzero(k, 0x80);
++	k[4] = 1u | (2u << 1) | (1u << 16);
++	k[6] = (uint32_t)(g + 0x40);
++	k[7] = (uint32_t)((g + 0x40) >> 32);
++	k[8] = (uint32_t)t;
++	k[9] = (uint32_t)(t >> 32);
++	k[10] = 1;
++	uint32_t *k2 = k + 0x40 / 4;
++	k2[4] = 1u | (2u << 1) | (2u << 16);
++	k2[8] = (uint32_t)(t + 8);
++	k2[9] = (uint32_t)((t + 8) >> 32);
++	k2[10] = 2;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++on7_mali_chain_test(const char *what, uint32_t *k, uint64_t g)
++{
++	volatile uint32_t *t = k + 0x100 / 4;
++	uint64_t a0 = mach_absolute_time(), ns;
++
++	on7_mali_write_chain(k, g, g + 0x100);
++	t[0] = t[2] = 0xdeadbeefu;
++	t[1] = t[3] = 0x12345678u;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	uint64_t seq = hakios_mali_enqueue(g, false);
++	bool done = hakios_mali_wait(seq, 2ull * NSEC_PER_SEC);
++	absolutetime_to_nanoseconds(mach_absolute_time() - a0, &ns);
++	bool ok = done && k[0] == 1 && k[0x40 / 4] == 1 && t[0] != 0xdeadbeefu && t[2] != 0xdeadbeefu;
++	IOLog("ON7 MALI: %s: seq %llu %s after %llu us; exceptions %08x/%08x cycles %08x%08x timestamp %08x%08x -> %s\n",
++	    what, seq, done ? "done" : "NOT DONE", ns / 1000, k[0], k[0x40 / 4], t[1], t[0], t[3], t[2],
++	    ok ? "ok" : "BAD");
++	return ok;
++}
++
++static void
++on7_mali_backend(volatile uint32_t *gpu, int step)
++{
++	on7_mali_say("8 backend: page table pool, queue, HakiosMali");
++	if (on7_gpu_regs == NULL) {
++		IOLog("ON7 MALI: no interrupts (step 7 did not run): no backend\n");
++		return;
++	}
++	(void)PE_parse_boot_argn("on7malitimeout", &on7_mali_timeout_ms, sizeof(on7_mali_timeout_ms));
++	on7_mali_lock = IOLockAlloc();
++	on7_queue_lock = IOLockAlloc();
++	for (uint32_t pages = ON7_POOL_PAGES; pages >= 64 && on7_pool_mem == NULL; pages /= 2) {
++		on7_pool_mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, pages * 4096, 0x000000fffffff000ULL);
++		on7_pool_pages = pages;
++	}
++	if (on7_mali_lock == NULL || on7_queue_lock == NULL || on7_pool_mem == NULL) {
++		IOLog("ON7 MALI: no locks / no page table pool\n");
++		return;
++	}
++	IOByteCount seglen = 0;
++	on7_pool_pa = on7_pool_mem->getPhysicalSegment(0, &seglen, kIOMemoryMapperNone);
++	on7_pool_va = (uint8_t *)on7_pool_mem->getBytesNoCopy();
++	bzero(on7_pool_va, on7_pool_pages * 4096);
++	flush_dcache64((addr64_t)on7_pool_pa, on7_pool_pages * 4096, TRUE);
++	on7_mali_transtab = on7_pool_pa | 3ULL | (1ULL << 2);
++	on7_mali_shader = on7_rd(gpu, MALI_SHADER_PRESENT);
++	on7_mali_tiler = on7_rd(gpu, MALI_TILER_PRESENT);
++	on7_mali_l2 = on7_rd(gpu, MALI_L2_PRESENT);
++	IOLog("ON7 MALI: page table pool %u pages at %llx (contiguous %llx bytes)\n", on7_pool_pages, on7_pool_pa,
++	    (uint64_t)seglen);
++	IOLockLock(on7_mali_lock);
++	bool up = on7_mali_hw_up(gpu, true);
++	IOLockUnlock(on7_mali_lock);
++	if (!up) {
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(&on7_mali_worker, NULL, &th) != KERN_SUCCESS) {
++		IOLog("ON7 MALI: no worker thread\n");
++		return;
++	}
++	thread_deallocate(th);
++	on7_mali_ok = true;
++
++	uint64_t v[41];
++	for (uint32_t i = 0; i < 41; i++) {
++		v[i] = 0xeeee;
++		(void)hakios_mali_parameter(i, &v[i]);
++	}
++	IOLog("ON7 MALI: params prod %llx rev %llx shader %llx tiler %llx l2 %llx as %llx js %llx l2f %llx core %llx tiler_f %llx mem %llx mmu %llx thread_f %llx max_thr %llx wg %llx coh %llx tex0 %llx js0f %llx js1f %llx js2f %llx groups %llu tls %llx\n",
++	    v[0], v[1], v[2], v[3], v[4], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15], v[17],
++	    v[18], v[22], v[23], v[24], v[38], v[39]);
++
++	uint64_t g = 0;
++	IOBufferMemoryDescriptor *bo = on7_mali_buffer(65536, 0, &g);
++	if (bo == NULL) {
++		return;
++	}
++	uint32_t *k = (uint32_t *)bo->getBytesNoCopy();
++	IOByteCount l = 0;
++	IOLog("ON7 MALI: buffer 64 KB at GPU %llx, phys %llx, pt pool %u/%u pages used\n", g,
++	    (uint64_t)bo->getPhysicalSegment(0, &l, kIOMemoryMapperNone), on7_pool_used, on7_pool_pages);
++
++	if (step >= 9) {
++		on7_mali_say("9 a chain from an unmapped address (MMU fault expected)");
++		uint64_t seq = hakios_mali_enqueue(0x7f000000ull, false);
++		bool done = hakios_mali_wait(seq, 5ull * NSEC_PER_SEC);
++		IOLog("ON7 MALI: fault test: seq %llu %s; failed %u resets %u; ready %d\n", seq, done ? "done" : "NOT DONE",
++		    on7_mali_failed, on7_mali_resets, on7_mali_ok);
++	}
++
++	bool ok = on7_mali_chain_test("BACKEND chain", k, g);
++	if (ok) {
++		uint64_t a0 = mach_absolute_time(), ns, seq = 0;
++		uint32_t f0 = on7_mali_failed, n0 = on7_mali_irq_n[1], bad = 0;
++		/* 200 chains of their own (a done descriptor run again fails with 0x58 DATA_INVALID, seen),
++		 * at +0x1000 + i * 0x80, all writing to +0x200 */
++		for (int i = 0; i < 200; i++) {
++			on7_mali_write_chain(k + (0x1000 + i * 0x80) / 4, g + 0x1000 + i * 0x80, g + 0x200);
++		}
++		for (int i = 0; i < 200; i++) {
++			seq = hakios_mali_enqueue(g + 0x1000 + i * 0x80, false);
++		}
++		bool done = hakios_mali_wait(seq, 10ull * NSEC_PER_SEC);
++		absolutetime_to_nanoseconds(mach_absolute_time() - a0, &ns);
++		for (int i = 0; i < 200; i++) {
++			bad += k[(0x1000 + i * 0x80) / 4] != 1 || k[(0x1040 + i * 0x80) / 4] != 1;
++		}
++		IOLog("ON7 MALI: 200 chains %s in %llu us (%llu us each), failed %u, JOB irqs +%u, descriptors not DONE %u\n",
++		    done ? "done" : "NOT DONE", ns / 1000, ns / 1000 / 200, on7_mali_failed - f0, on7_mali_irq_n[1] - n0, bad);
++		ok = done && bad == 0 && on7_mali_failed == f0 && on7_mali_chain_test("BACKEND chain again", k, g);
++	}
++	/* the buffer given back the way a client's is (wait, unmap, release) */
++	hakios_mali_unmap(g, 65536);
++	bo->release();
++	IOLog("ON7 MALI: test buffer freed, %llu GPU granules in use; jobs %u failed %u resets %u spurious %u\n",
++	    on7_va.taken, on7_mali_jobs, on7_mali_failed, on7_mali_resets, on7_mali_irq_spurious);
++	if (!ok || !on7_mali_ok) {
++		IOLog("ON7 MALI: backend test failed: no HakiosMali\n");
++		return;
++	}
++	HakiosMaliStart();
++}
+ #endif /* A5XELTE */
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {

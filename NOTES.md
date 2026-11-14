@@ -275,6 +275,51 @@ BOOT p10, extra `sweetfb_hz=60 on7mali=1 on7malistep=7`; boot 22:13, same usblog
   [G] Note: HakiosMali is "written and built, not yet run on the phone" on
   the a50 too, so this is its first hardware run.
 
+**0193 RESULT (GPU step 5, backend + HakiosMali; xnu88 = 0187..0193,
+`scratchpad/build193.sh` as root; BOOT p10, extra `sweetfb_hz=60 on7mali=1
+on7malistep=9`; boot 22:35, same usblog):**
+- 0193 (SweetFramebuffer.cpp only, on7malistep 8/9): backend with the a50's
+  names (`hakios_mali_ready/parameter/address/map/mapped/unmap/submit/
+  enqueue/wait`) and the a50's HakiosMali + HakiosMaliUserClient (same class
+  names, selectors 0x09 0x40-0x45 0x48 0x7d and structures; IOSurface
+  requests 0x7c/0x7e/0x7f dropped, buffers are WC IOBufferMemoryDescriptors
+  as on the a50). Page tables: Mali LPAE from a 2 MB contiguous pool (tables
+  taken as needed, never freed: up to ~1 GB mapped), 4 KB GPU pages, CPU
+  flush of the touched entries, then AS0 LOCKADDR(31) + LOCK + FLUSH_PT.
+  VA allocator = a50 hakios.mali_va.h (32 MB..4 GB, 64 KB granules).
+  Queue (64) + one worker; JS0 fragment / JS1 other; the worker sleeps on the
+  JOB IRQ counter (0192) in 10 ms slices, 1 s limit (`on7malitimeout` ms).
+  Failure/timeout: log JS_STATUS + MMU/GPU fault, soft reset (hard reset as
+  fallback), quirks, power, AS0, IRQ masks, CYCLE_COUNT_START.
+- [O] params: prod 0x830 rev 0x10, shader/tiler/l2 1, AS 0xff, JS 7,
+  L2_FEATURES 0x07100206, TILER_FEATURES 0x809, MMU 0x2821, THREAD_FEATURES
+  0x0a040400, MAX_THREADS 0x100, WG 0x80, COHERENCY 0, TEXTURE0 0xfffe003f,
+  JS0/1/2_FEATURES 0x20e/0x1fe/0x7e, core groups 1, TLS 0x100 (= max threads).
+- [O] Quirk [G]: L2_MMU_CONFIG already 0 (nothing to clear).
+- [O] step 9 fault test: chain at unmapped 0x7f000000 -> MMU IRQ, AS0
+  FAULTSTATUS 0x7c1002c1 at 0x7f000000 (translation fault), JS1 stalls
+  (js_status 0x08 active) -> 1 s timeout -> reset + bring-up OK.
+- [O] then: chain in a 64 KB client-style buffer at GPU 0x02000000 done after
+  156 us, both descriptors DONE, cycles/timestamp written; **200 separate
+  chains in 14.2 ms (70 us each), 0 failed, 200 JOB IRQs, all descriptors
+  DONE**; chain again ok; buffer unmapped + freed (0 granules left);
+  `HakiosMali registered`. Boot normal, no panic.
+- [O] First run (xnu87) resubmitted the SAME (already DONE) descriptors 200
+  times: every one failed with JS_STATUS 0x58 (DATA_INVALID_FAULT), each
+  recovered by a reset (201 resets, boot fine). Descriptors must be fresh
+  (exception status 0) per submit, as Mesa writes them. Also seen: after a
+  soft reset WRITE_VALUE cycle/timestamp write 0 until CYCLE_COUNT_START.
+- [I] Kernel side of a panfrost-style GPU path is complete enough for a
+  userland client; not yet exercised by a real user process (no test binary
+  on the J7 root; putting one there means writing the userdata image, which
+  needs the user's OK).
+- NEXT (GPU step 6): userland smoke test through IOKit: the a50's
+  `core/userland/src/mali_test.c` (opens IOServiceMatching("HakiosMali"),
+  create_bo, IOConnectMapMemory64, WRITE_VALUE chain, submit, wait) built for
+  arm64 iOS and run once from the root (needs a way to place the binary:
+  ask the user before touching userdata), then Mesa panfrost through
+  `tools/mali-drmshim` (T830 = Midgard v5 in Mesa's panfrost).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
