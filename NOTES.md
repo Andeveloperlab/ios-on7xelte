@@ -563,6 +563,28 @@ for the user's OK: it raises the GPU voltage and clock):**
   show line first (vsel should read ~0.6-0.75 V at 343 MHz). Undo: boot
   without a5gpufreq (the PLL and BUCK2 reset with the board).
 
+**GPU AT 1001 MHz (xnu94, a5gpufreq=1001, booted 2026-11-15 01:07):**
+- [O] Extra boot-args `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1
+  a5gpufreq=1001`. At 12.4 s: `USB> gpufreq: 1001000 kHz at 1006250 uV
+  (G3D_PLL 0xa09a0400), 46 C`. on7mali step 4: `cycles 11073336 timestamp
+  287618 in 11062 us -> GPU clock ~1001 MHz`. Reset, caches, AS0 fine;
+  `jobs 202 failed 0 resets 0`, no MMU/GPU faults. cpufreq 1482 at 24.2 s
+  (49 C). backboardd and Wi-Fi came up as before.
+- [O] gl_test (pid 94) ALL OK, exit 0, every GL error 0, middle pixel
+  ff4775af (same as xnu93). Context 89.4 ms, clear red 2.23 ms, triangle
+  1.24 ms, 100 frames 0.966 ms each, textures 93.6 ms.
+- [O] Fill 1080x1920, ms shortest/mean (xnu93 at 343 MHz in brackets):
+  clear only 2.99/3.11 (7.71); small rectangle no clear 4.05/4.22 (9.32);
+  clear+1/2/4/8 rectangles 5.10/5.28/6.21/10.60 (13.4/13.88/16.49/29.10);
+  clear+1/2/4/8 textured blended 8.73/16.46/31.93/63.10
+  (23.93/46.80/91.48/182.34).
+- [I] 2.5-2.9x faster (clock ratio 2.92): fill is GPU-clock bound, memory
+  is not the limit yet. A 60 Hz frame (16.7 ms) now holds a clear plus ~1
+  full-screen textured layer, or ~8 opaque layers.
+- NEXT: make `a5gpufreq=1001` part of the standard boot-args (thermal guard
+  drops to 343 MHz at 85 C); then the path to the screen (IOSurface import
+  / eagl).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
