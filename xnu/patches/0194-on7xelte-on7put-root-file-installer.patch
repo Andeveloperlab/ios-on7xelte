@@ -1,6 +1,6 @@
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -473,6 +473,203 @@
+@@ -473,6 +473,272 @@
   * of the tro_ucred field so that the uthread structure can be
   * used like any other.
   */
@@ -15,9 +15,12 @@
 + *   "before" given and the file is not it   -> left alone (the root is not what the payload was made for)
 + *   "backup" given and not there yet        -> the current file copied there first
 + *   then written (O_TRUNC, IO_SYNC, fsync), mode set (uid/gid 0 only for a new file), read back and checked.
++ * A file with zlen != 0 is carried zlib-compressed (zlen bytes; len is its size) and inflated first: the payload
++ * rides in the kernel image, which has to fit the 32 MiB BOOT partition (Mesa's library alone is ~15 MB).
 + */
 +#include <sys/fcntl.h>
 +#include <sys/uio.h>
++#include <libkern/zlib.h>
 +
 +struct on7put_file {
 +	const char *path;
@@ -28,12 +31,13 @@
 +	uint64_t before_hash;
 +	uint32_t before_len;
 +	const char *backup;
++	uint32_t zlen;          /* 0: data is the file; else data is zlen bytes of zlib stream */
 +};
 +
 +#if __has_include("on7put_payload.h")
 +#include "on7put_payload.h"
 +#else
-+static const struct on7put_file on7put_files[] = { { NULL, 0, NULL, 0, 0, 0, 0, NULL } };
++static const struct on7put_file on7put_files[] = { { NULL, 0, NULL, 0, 0, 0, 0, NULL, 0 } };
 +#define ON7PUT_COUNT 0
 +#define ON7PUT_TAG "none"
 +#endif
@@ -128,6 +132,60 @@
 +	return err ? err : err2;
 +}
 +
++static void *
++on7put_zalloc(void *opaque, u_int items, u_int size)
++{
++	vm_size_t n = (vm_size_t)items * size + 16;
++	uint64_t *p = kalloc_data(n, Z_WAITOK | Z_ZERO);
++
++	(void)opaque;
++	if (p == NULL) {
++		return NULL;
++	}
++	p[0] = n;
++	return p + 2;
++}
++
++static void
++on7put_zfree(void *opaque, void *ptr)
++{
++	uint64_t *p = (uint64_t *)ptr - 2;
++
++	(void)opaque;
++	kfree_data(p, (vm_size_t)p[0]);
++}
++
++/* a compressed file of the payload into a new buffer of f->len bytes (+1); NULL if it does not inflate to that */
++static unsigned char *
++on7put_inflate(const struct on7put_file *f)
++{
++	unsigned char *out = kalloc_data((vm_size_t)f->len + 1, Z_WAITOK | Z_ZERO);
++	z_stream z;
++	int zr;
++
++	if (out == NULL) {
++		return NULL;
++	}
++	bzero(&z, sizeof(z));
++	z.zalloc = on7put_zalloc;
++	z.zfree = on7put_zfree;
++	z.next_in = (Bytef *)(uintptr_t)f->data;
++	z.avail_in = f->zlen;
++	z.next_out = out;
++	z.avail_out = f->len;
++	if ((zr = inflateInit(&z)) == Z_OK) {
++		zr = inflate(&z, Z_FINISH);
++		(void)inflateEnd(&z);
++	}
++	if (zr != Z_STREAM_END || z.total_out != f->len) {
++		printf("ON7 PUT: %s: payload does not inflate (zlib %d, %lu of %u bytes)\n", f->path, zr,
++		    (unsigned long)z.total_out, f->len);
++		kfree_data(out, (vm_size_t)f->len + 1);
++		return NULL;
++	}
++	return out;
++}
++
 +static void
 +on7put_install(void)
 +{
@@ -139,14 +197,21 @@
 +	printf("ON7 PUT: payload %s, %d files\n", ON7PUT_TAG, ON7PUT_COUNT);
 +	for (int i = 0; i < ON7PUT_COUNT; i++) {
 +		const struct on7put_file *f = &on7put_files[i];
-+		uint64_t want = on7put_fnv(f->data, f->len), have = 0;
++		unsigned char *inflated = f->zlen ? on7put_inflate(f) : NULL;
++		const unsigned char *data = f->zlen ? inflated : f->data;
++		uint64_t want, have = 0;
 +		unsigned char *cur = NULL;
 +		uint32_t curlen = 0;
-+		int err = on7put_read(f->path, &cur, &curlen);
++		int err;
 +
++		if (data == NULL) {
++			continue;
++		}
++		want = on7put_fnv(data, f->len);
++		err = on7put_read(f->path, &cur, &curlen);
 +		if (err && err != ENOENT) {
 +			printf("ON7 PUT: %s: read error %d, left alone\n", f->path, err);
-+			continue;
++			goto next;
 +		}
 +		if (err == 0) {
 +			have = on7put_fnv(cur, curlen);
@@ -154,7 +219,7 @@
 +		if (err == 0 && curlen == f->len && have == want) {
 +			printf("ON7 PUT: %s: already the payload (%u bytes)\n", f->path, curlen);
 +			kfree_data(cur, (vm_size_t)curlen + 1);
-+			continue;
++			goto next;
 +		}
 +		if (f->has_before && (err != 0 || curlen != f->before_len || have != f->before_hash)) {
 +			printf("ON7 PUT: %s: is %s (%u bytes, %016llx), not the expected %u bytes %016llx: LEFT ALONE\n",
@@ -162,7 +227,7 @@
 +			if (cur) {
 +				kfree_data(cur, (vm_size_t)curlen + 1);
 +			}
-+			continue;
++			goto next;
 +		}
 +		if (err == 0 && f->backup) {
 +			unsigned char *old = NULL;
@@ -174,7 +239,7 @@
 +				printf("ON7 PUT: %s: backup %s (%u bytes): %d\n", f->path, f->backup, curlen, e2);
 +				if (e2) {
 +					kfree_data(cur, (vm_size_t)curlen + 1);
-+					continue;
++					goto next;
 +				}
 +			} else {
 +				printf("ON7 PUT: %s: backup %s already there (%d)\n", f->path, f->backup, e2);
@@ -187,7 +252,7 @@
 +			kfree_data(cur, (vm_size_t)curlen + 1);
 +			cur = NULL;
 +		}
-+		err = on7put_write(f->path, f->data, f->len, f->mode, err == ENOENT);
++		err = on7put_write(f->path, data, f->len, f->mode, err == ENOENT);
 +		if (err == 0 && (err = on7put_read(f->path, &cur, &curlen)) == 0) {
 +			have = on7put_fnv(cur, curlen);
 +			if (curlen != f->len || have != want) {
@@ -195,8 +260,12 @@
 +			}
 +			kfree_data(cur, (vm_size_t)curlen + 1);
 +		}
-+		printf("ON7 PUT: %s: written %u bytes mode %o, read back %s (%d)\n", f->path, f->len, f->mode,
-+		    err ? "FAILED" : "ok", err);
++		printf("ON7 PUT: %s: written %u bytes%s mode %o, read back %s (%d)\n", f->path, f->len,
++		    f->zlen ? " (inflated)" : "", f->mode, err ? "FAILED" : "ok", err);
++next:
++		if (inflated) {
++			kfree_data(inflated, (vm_size_t)f->len + 1);
++		}
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
@@ -204,7 +273,7 @@
  void
  bsd_init(void)
  {
-@@ -1074,6 +1271,9 @@
+@@ -1074,6 +1340,9 @@
  	machine_timeout_bsd_init();
  #endif /* DEVELOPMENT || DEBUG */
  

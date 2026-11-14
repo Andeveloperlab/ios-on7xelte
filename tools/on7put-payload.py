@@ -3,12 +3,14 @@
 
   on7put-payload.py OUT.h TAG SPEC...
 
-  SPEC = DEST=SRC,MODE[,before=FILE][,backup=PATH]
-    DEST    absolute path in the iOS root
+  SPEC = DEST=SRC,MODE[,before=FILE][,backup=PATH][,z]
+    DEST    absolute path in the iOS root (its directory must exist: the kernel makes none)
     SRC     local file whose bytes go there
     MODE    octal (0755)
     before  the file DEST must be now (size + FNV-1a 64) or it is left alone
     backup  where the current DEST is copied first (only if not there yet)
+    z       carry it zlib-compressed (level 9); the kernel inflates it first (0194 with the zlen
+            field). The payload rides in the kernel image, which must fit the 32 MiB BOOT partition.
 
 Example (mali_test, ios-root-files artifact of root-tweak.yml with mali_test=true):
   on7put-payload.py on7put_payload.h malitest-43634883047 \\
@@ -18,6 +20,7 @@ Example (mali_test, ios-root-files artifact of root-tweak.yml with mali_test=tru
 The header can hold Apple files (launchd.plist): it belongs to a local build only, never to git.
 """
 import sys
+import zlib
 
 
 def fnv(b):
@@ -41,22 +44,26 @@ def main():
         dest, rest = spec.split('=', 1)
         parts = rest.split(',')
         src, mode = parts[0], int(parts[1], 8)
-        opts = dict(p.split('=', 1) for p in parts[2:])
+        opts = dict(p.split('=', 1) if '=' in p else (p, '1') for p in parts[2:])
         assert dest.startswith('/'), dest
+        assert set(opts) <= {'before', 'backup', 'z'}, opts
         data = open(src, 'rb').read()
-        lines.append('static const unsigned char on7put_d%d[%d] = {' % (i, max(len(data), 1)))
-        for at in range(0, len(data), 24):
-            lines.append('\t' + ','.join('0x%02x' % c for c in data[at:at + 24]) + ',')
+        z = 'z' in opts
+        carried = zlib.compress(data, 9) if z else data
+        assert zlib.decompress(carried) == data if z else True
+        lines.append('static const unsigned char on7put_d%d[%d] = {' % (i, max(len(carried), 1)))
+        for at in range(0, len(carried), 24):
+            lines.append('\t' + ','.join('0x%02x' % c for c in carried[at:at + 24]) + ',')
         lines.append('};')
         before = 0, 0, 0
         if 'before' in opts:
             b = open(opts['before'], 'rb').read()
             before = 1, fnv(b), len(b)
         backup = cstr(opts['backup']) if 'backup' in opts else 'NULL'
-        entries.append('\t{ %s, 0%o, on7put_d%d, %d, %d, 0x%016xULL, %d, %s },' % (
-            cstr(dest), mode, i, len(data), before[0], before[1], before[2], backup))
-        print('%s <- %s: %d bytes, fnv %016x, mode %o%s%s' % (
-            dest, src, len(data), fnv(data), mode,
+        entries.append('\t{ %s, 0%o, on7put_d%d, %d, %d, 0x%016xULL, %d, %s, %d },' % (
+            cstr(dest), mode, i, len(data), before[0], before[1], before[2], backup, len(carried) if z else 0))
+        print('%s <- %s: %d bytes%s, fnv %016x, mode %o%s%s' % (
+            dest, src, len(data), ' (zlib %d)' % len(carried) if z else '', fnv(data), mode,
             ', before %d bytes %016x' % (before[2], before[1]) if before[0] else '',
             ', backup ' + opts['backup'] if 'backup' in opts else ''))
     lines.append('static const struct on7put_file on7put_files[] = {')

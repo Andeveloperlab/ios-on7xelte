@@ -405,6 +405,48 @@ the user's OK because it writes two files into the iOS root on userdata):**
 - NEXT (GPU step 7): Mesa panfrost (Midgard v5) built for iOS against the
   a50's `tools/mali-drmshim` on HakiosMali, first a compute/clear test.
 
+**GPU step 7 PREPARED: Mesa panfrost for iOS + gl_test (xnu91; NOT yet booted,
+waits for the user's OK: it writes 3 files into the iOS root on userdata):**
+- [O] a50 ABI check: J7 HakiosMali (0193) answers SUBMIT with the job number
+  in `jc`, waits by number with 0x7d, has GET_PARAM/CREATE/MMAP/OFFSET/
+  WAIT_BO/MADVISE/GEM_CLOSE = what the a50's `hakios-drm/hakios.drm.c`
+  expects (it announces panfrost 1.2, so Mesa asks no timestamp frequency).
+  Mesa 25.0.7 knows the T830: `MODEL(0x830, 0, "T830", ...)` in pan_props.c.
+- `tools/mesa/` (commit 45b2ab5, then eb63697/32f72da): the a50's hakios-drm
+  + freedreno-darwin/panfrost-darwin/pack-pointer/osmesa-es-profile patches
+  (MIT, README.md), all apply cleanly to 25.0.7 (checked in WSL). Ours:
+  `panfrost-tiler-heap.patch` (tiler heap 32 MB instead of 128 MB on
+  Darwin: HakiosMali wires every buffer in full; `PAN_TILER_HEAP_MB`).
+  `mk-mesa-ios.sh` + `.github/workflows/mesa.yml` (macOS, Xcode iphoneos SDK,
+  softpipe+panfrost, -Os, -dead_strip, install names @rpath). CI run
+  43640746910 success: ONE library `libOSMesa.8.dylib` 11 239 008 bytes
+  (glapi linked in; -O3 was 14.9 MB, run 43640398465), sha256 37f2bad3...
+- `tools/gl_test/gl_test.c`: ES2 OSMesa context, logs GL_RENDERER (panfrost
+  = GPU, softpipe = CPU fallback), clear red 64x64 FBO + read back, then a
+  RGB triangle + read back (pixels + a 16x16 letter picture), 100 frames
+  timing, alarm(60) watchdog. Logs `USB> on7wifid: gl: ...`; Mesa's stderr
+  goes there too as `gl!:`. mali_test step 6 (same commit) spawns
+  /usr/local/bin/gl_test after its own test and logs its exit/signal, so
+  launchd.plist does not change again.
+- on7put can carry zlib files now (0194 updated: struct field `zlen`, kernel
+  zlib inflate/inflateInit_/inflateEnd, `on7put-payload.py ...,z`): the
+  BOOT partition is 32 MiB and kernel 17.3 MB + raw lib would not fit.
+  /usr/local/lib likely does not exist and on7put makes no directories, so
+  everything goes to /usr/local/bin (gl_test rpath = @executable_path).
+- xnu91 = xnu90 + 0194(zlen) + payload `glmesa-43640746910`
+  (`scratchpad/build195.sh`, header `p195/on7put_payload.h`): mali_test
+  70496 (new, step 6), gl_test 88720, libOSMesa.8.dylib 11239008 (zlib
+  2954164). Kernel 19 527 912 bytes, sha256 95929d8a...c9c9,
+  `candidates/xnu91.kernel`; the compressed lib inflates byte-identical out
+  of the image. launchd.plist is not in this payload (already installed).
+- NEXT (needs the user's yes): flash xnu91, same extra boot-args
+  `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1`. Expect `ON7 PUT: ...
+  written ... (inflated) ... read back ok` x3, mali_test `mt:` lines as on
+  xnu90 + `6: /usr/local/bin/gl_test started`, then `gl:` lines. Risks
+  [G]: dyld refusing the ad-hoc dylib, Mesa failing on Midgard specifics
+  (`gl!` lines say), a GPU fault/hang (kernel resets after 1 s; gl_test
+  gives up after 60 s). Undo: none needed (3 extra files in /usr/local/bin).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
