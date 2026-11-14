@@ -10,8 +10,11 @@
  *   2  a 64 x 64 texture as the framebuffer, cleared red, read back
  *   3  one triangle (red, green, blue corners) over a dark blue clear, read back: a few pixels
  *   4  ROUNDS more clear + triangle + glFinish (default 100) for the time a frame takes
+ *   5  full-screen fill timing (the a50's "gl_test fill"): a WIDTH x HEIGHT (default the panel, 1080 x 1920)
+ *      texture as the framebuffer; a clear alone, one small rectangle, a clear + 1/2/4/8 full-screen
+ *      rectangles, the same textured + blended; 16 frames of each (glFinish each), shortest/longest/mean
  *
- *   gl_test [ROUNDS]       (tools/mali_test runs it after its own test, when it is installed)
+ *   gl_test [ROUNDS [WIDTH HEIGHT]]   (WIDTH 0: no step 5; tools/mali_test runs it with no arguments)
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -59,16 +62,27 @@ extern void glUseProgram(unsigned program);
 extern void glVertexAttribPointer(unsigned index, int size, unsigned type, unsigned char normalized, int stride,
     const void *pointer);
 extern void glEnableVertexAttribArray(unsigned index);
+extern void glDisableVertexAttribArray(unsigned index);
 extern void glDrawArrays(unsigned mode, int first, int count);
 extern void glFinish(void);
 extern void glReadPixels(int x, int y, int width, int height, unsigned format, unsigned type, void *pixels);
+extern void glEnable(unsigned cap);
+extern void glDisable(unsigned cap);
+extern void glBlendFunc(unsigned sfactor, unsigned dfactor);
+extern int glGetUniformLocation(unsigned program, const char *name);
+extern void glUniform1i(int location, int value);
+extern void glUniform4f(int location, float x, float y, float z, float w);
 
 #define OSMESA_RGBA                     0x1908
 #define OSMESA_FORMAT                   0x22
 #define OSMESA_PROFILE                  0x33
 #define OSMESA_CONTEXT_MAJOR_VERSION    0x36
 #define OSMESA_ES_PROFILE               0x38
+#define GL_ONE                          1
 #define GL_TRIANGLES                    0x0004
+#define GL_TRIANGLE_STRIP               0x0005
+#define GL_ONE_MINUS_SRC_ALPHA          0x0303
+#define GL_BLEND                        0x0be2
 #define GL_TEXTURE_2D                   0x0de1
 #define GL_UNSIGNED_BYTE                0x1401
 #define GL_FLOAT                        0x1406
@@ -77,6 +91,7 @@ extern void glReadPixels(int x, int y, int width, int height, unsigned format, u
 #define GL_RENDERER                     0x1f01
 #define GL_VERSION                      0x1f02
 #define GL_NEAREST                      0x2600
+#define GL_LINEAR                       0x2601
 #define GL_TEXTURE_MAG_FILTER           0x2800
 #define GL_TEXTURE_MIN_FILTER           0x2801
 #define GL_COLOR_BUFFER_BIT             0x4000
@@ -171,7 +186,7 @@ static void
 on_alarm(int sig)
 {
 	(void)sig;
-	say("TIMEOUT: no answer within 60 s (GPU hang?) -> FAILED");
+	say("TIMEOUT: no answer in time (GPU hang?) -> FAILED");
 	flush_stderr();
 	_exit(3);
 }
@@ -212,6 +227,132 @@ pixel(const uint8_t *p, int x, int y)
 	return (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3];
 }
 
+/* 5: full-screen fill timing, after the a50's fill(); 0 = it went */
+static int
+fill(int width, int height)
+{
+	static const float all[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+	static const float some[] = { -0.1f, -0.1f, 0.1f, -0.1f, -0.1f, 0.1f, 0.1f, 0.1f };
+	static const struct {
+		int clear, layers, textured, small;
+		const char *what;
+	} kinds[] = {
+		{ 1, 0, 0, 0, "clear only" },
+		{ 0, 1, 0, 1, "one small rectangle, no clear" },
+		{ 1, 1, 0, 0, "clear + 1 rectangle" },
+		{ 1, 2, 0, 0, "clear + 2 rectangles" },
+		{ 1, 4, 0, 0, "clear + 4 rectangles" },
+		{ 1, 8, 0, 0, "clear + 8 rectangles" },
+		{ 1, 1, 1, 0, "clear + 1 textured blended" },
+		{ 1, 2, 1, 0, "clear + 2 textured blended" },
+		{ 1, 4, 1, 0, "clear + 4 textured blended" },
+		{ 1, 8, 1, 0, "clear + 8 textured blended" },
+	};
+	unsigned picture = 0, target = 0, framebuffer = 0, program, error;
+	uint32_t *texels = malloc((size_t)width * height * 4), mid = 0;
+	int good = 0, textured, colour, failed = 0;
+	uint64_t t0;
+
+	if (texels == NULL) {
+		say("fill: no memory for %d x %d -> FAILED", width, height);
+		return 1;
+	}
+	for (size_t i = 0; i < (size_t)width * height; i++) {
+		texels[i] = 0x80404040u + ((uint32_t)i * 2654435761u >> 28);
+	}
+	t0 = mach_absolute_time();
+	glGenTextures(1, &picture);
+	glBindTexture(GL_TEXTURE_2D, picture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels);
+	free(texels);
+	glGenTextures(1, &target);
+	glBindTexture(GL_TEXTURE_2D, target);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	glGenFramebuffers(1, &framebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
+	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+		say("fill: %d x %d framebuffer incomplete -> FAILED", width, height);
+		return 1;
+	}
+	glViewport(0, 0, width, height);
+	glFinish();
+	say("fill %d x %d: textures made (one uploaded, %.1f MB) in %.1f ms, error %#x", width, height,
+	    width * height * 4 / 1e6, ms_since(t0), glGetError());
+
+	program = glCreateProgram();
+	glAttachShader(program, shader(GL_VERTEX_SHADER,
+	    "attribute vec2 where; varying vec2 at;\n"
+	    "void main() { gl_Position = vec4(where, 0.0, 1.0); at = where * 0.5 + 0.5; }\n"));
+	glAttachShader(program, shader(GL_FRAGMENT_SHADER,
+	    "precision mediump float; varying vec2 at; uniform sampler2D picture; uniform int textured;"
+	    " uniform vec4 colour;\n"
+	    "void main() { gl_FragColor = textured != 0 ? texture2D(picture, at) * colour : colour; }\n"));
+	glBindAttribLocation(program, 0, "where");
+	glLinkProgram(program);
+	glGetProgramiv(program, GL_LINK_STATUS, &good);
+	if (!good) {
+		say("fill: program does not link -> FAILED");
+		return 1;
+	}
+	glUseProgram(program);
+	textured = glGetUniformLocation(program, "textured");
+	colour = glGetUniformLocation(program, "colour");
+	glUniform1i(glGetUniformLocation(program, "picture"), 0);
+	glBindTexture(GL_TEXTURE_2D, picture);
+	glEnableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glClearColor(0.1f, 0.1f, 0.1f, 1);
+
+	for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+		double least = 1e9, most = 0, sum = 0;
+
+		glVertexAttribPointer(0, 2, GL_FLOAT, 0, 0, kinds[k].small ? some : all);
+		glUniform1i(textured, kinds[k].textured);
+		if (kinds[k].textured) {
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		} else {
+			glDisable(GL_BLEND);
+		}
+		for (int frame = 0; frame < 16; frame++) {
+			double ms;
+
+			t0 = mach_absolute_time();
+			if (kinds[k].clear) {
+				glClear(GL_COLOR_BUFFER_BIT);
+			}
+			for (int layer = 0; layer < kinds[k].layers; layer++) {
+				glUniform4f(colour, 0.2f + 0.1f * layer, 0.5f, 0.3f, 0.5f);
+				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+			}
+			glFinish();
+			ms = ms_since(t0);
+			sum += ms;
+			least = ms < least ? ms : least;
+			most = ms > most ? ms : most;
+		}
+		error = glGetError();
+		say("  %-29s %7.2f ms shortest %7.2f longest %7.2f mean, error %#x", kinds[k].what, least, most,
+		    sum / 16, error);
+		if (error != 0) {
+			failed = 1;
+		}
+	}
+	glDisable(GL_BLEND);
+	/* the last frame: 8 textured layers over the clear; the pixel in the middle, read back */
+	glReadPixels(width / 2, height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &mid);
+	say("fill: middle pixel bytes %08x (r g b a, little-endian word), error %#x", mid, glGetError());
+	if (mid == 0 || mid == 0xff1a1a1au) {
+		failed = 1;     /* nothing drawn over the clear colour */
+	}
+	return failed;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -225,6 +366,7 @@ main(int argc, char **argv)
 	};
 	static uint8_t window[SIZE * SIZE * 4], drawn[SIZE * SIZE * 4];
 	int rounds = argc > 1 ? atoi(argv[1]) : 100, good = 0, ok = 1;
+	int width = argc > 3 ? atoi(argv[2]) : 1080, height = argc > 3 ? atoi(argv[3]) : 1920;
 	unsigned texture = 0, framebuffer = 0, program;
 	OSMesaContext context;
 	uint64_t t0;
@@ -233,7 +375,7 @@ main(int argc, char **argv)
 	capture_stderr();
 	signal(SIGALRM, on_alarm);
 	alarm(60);
-	say("start (pid %d, %d rounds)", getpid(), rounds);
+	say("start (pid %d, %d rounds, fill %d x %d)", getpid(), rounds, width, height);
 
 	t0 = mach_absolute_time();
 	context = OSMesaCreateContextAttribs(attributes, NULL);
@@ -346,6 +488,14 @@ main(int argc, char **argv)
 	if (rounds > 0) {
 		say("%d frames (clear + triangle + glFinish): %.3f ms each, error %#x", rounds, ms_since(t0) / rounds,
 		    glGetError());
+	}
+
+	/* 5: full-screen fill timing (a watchdog of its own: 160 big frames take a while) */
+	if (width > 0 && height > 0) {
+		alarm(120);
+		if (fill(width, height) != 0) {
+			ok = 0;
+		}
 	}
 
 	OSMesaDestroyContext(context);
