@@ -124,6 +124,29 @@ log `candidates/xnu14/usblog-20261114-154207-ts.txt` from 18:13:04):**
   (vhaddq_u8), then re-measure with the same stat line. Phone stays on xnu80
   hz=60 until then.
 
+**0188 RESULT (xnu81 = 0187 + 0188, `scratchpad/build188.sh` as root; BOOT p10,
+extra `sweetfb_hz=60`; boot 18:32:15, same usblog):**
+- 0188 = present on its own kernel thread (vsync tick only hands the record over,
+  a frame arriving while one is shown stays pending), vsync re-armed from an
+  absolute deadline (`wakeAtTime`), scale split by panel rows into 4 parts
+  (present thread + 3 helpers, boot-arg `sweetfb_workers`, 1-8), vertical
+  average first, two pixels per 64-bit op (no NEON used), then the horizontal
+  pick. Log line at start: `SWEET FB: present thread + 4 scale parts`.
+  Patch chain checked locally: b185 + 0187 + 0188 == built source.
+- [O] present **avg 8.8-10.9 ms, max 14.4 ms** (was 34-36 / 39 ms): 3.8x.
+- [O] vsyncs exactly 600-601 per 10 s in every window, also under load (was 472-567).
+- [O] Under use (scrolling): **swaps 199-236 per 10 s, presents = swaps +-3**
+  (was max 62/49). So CA now delivers ~20-24 fps and every frame reaches the
+  panel. [I] CA paced on our late vsyncs before; now CA's own CPU rendering is
+  the limit (present could take ~100/s).
+- [O] No panic, no backboardd/SpringBoard crash; PosterBoard sig 5 at ~161 s as
+  every boot. Not yet: user's visual check of the new build (tearing is possible:
+  still one panel buffer, written while DECON scans).
+- NEXT options: (a) NEON/vtbl horizontal pass or DECON double buffer (option 2)
+  only if tearing is visible; (b) the real limit is now CA's SW renderer in
+  backboardd: sample backboardd (sweetsmp-style) to see where the ~40 ms/frame
+  goes before deciding on the Mali/Panfrost route (option 4).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is

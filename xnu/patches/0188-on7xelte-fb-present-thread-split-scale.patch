@@ -1,0 +1,301 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -99,6 +99,11 @@
+ #define SWEET_FB_LOGICAL_H              2436
+ #endif
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++#define SWEET_FB_WORKERS_MAX            8
++
++extern "C" kern_return_t kernel_thread_start(thread_continue_t continuation,
++    void *parameter, thread_t *new_thread);
++extern "C" void thread_deallocate(thread_t thread);
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -139,7 +144,33 @@
+ 	uint32_t     *fScaleX;        /* panel column -> logical column */
+ 	AppleARMBacklight *fBL;        /* 0154: panel backlight, NULL without DSI */
+ 
++	/* 0188: presents run on their own thread; the scale is split by rows. */
++	uint64_t      fNextVsync;     /* absolute deadline of the next vsync */
++	uint64_t      fVsyncPeriod;
++	bool          fPresenter;     /* present thread running */
++	bool          fPresentReady;  /* fPresentRec holds a frame to show */
++	bool          fPresentBusy;   /* the present thread is showing one */
++	uint8_t       fPresentRec[SWEET_FB_SWAP_REC_SIZE];
++	IOLock       *fJobLock;
++	uint32_t      fWorkers;       /* scale parts: presenter + fWorkers-1 helpers */
++	uint32_t      fJobGen, fJobDone;
++	uint32_t     *fRowBuf[SWEET_FB_WORKERS_MAX];
++	struct {
++		AppleCLCD *fb;
++		uint32_t   idx;
++	} fWorkerArg[SWEET_FB_WORKERS_MAX];
++	struct {
++		const uint8_t *base;  /* surface pixels, s->offset applied */
++		uint32_t       bpr;
++		int32_t        sx, sy, dx, dy, w, h;
++		uint32_t       px0, px1, py0, py1;
++	} fJob;
++
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void startPresenter();
++	void scaleRows(uint32_t part, uint32_t parts, uint32_t *tmp);
++	static void presenterMain(void *arg, wait_result_t wr);
++	static void workerMain(void *arg, wait_result_t wr);
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -523,6 +554,8 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++	clock_interval_to_absolutetime_interval(SWEET_FB_VSYNC_US, NSEC_PER_USEC, &fVsyncPeriod);
++	startPresenter();
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+@@ -647,12 +680,26 @@
+ 				}
+ 			}
+ 		}
++		fb->fNextVsync = 0;
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
+-	if (flush) {
++	if (flush && fb->fPresenter) {
++		/*
++		 * 0188: hand the frame to the present thread and return, so a slow
++		 * present no longer delays vsync. A frame that comes while one is
++		 * being shown stays pending (fDirty) for a later tick.
++		 */
++		if (!fb->fPresentBusy) {
++			memcpy(fb->fPresentRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++			fb->fDirty = false;
++			fb->fPresentBusy = true;
++			fb->fPresentReady = true;
++			IOLockWakeup(fb->fLock, &fb->fPresentReady, true);
++		}
++	} else if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+@@ -667,7 +714,113 @@
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sweet_fb_stat_report(fb->fFlushTicks, fb->fScaled);
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/* 0188: fixed period from an absolute deadline (setTimeoutUS drifted). */
++	uint64_t after = mach_absolute_time();
++	if (fb->fNextVsync == 0 || fb->fNextVsync + fb->fVsyncPeriod <= after) {
++		fb->fNextVsync = after + fb->fVsyncPeriod;
++	} else {
++		fb->fNextVsync += fb->fVsyncPeriod;
++	}
++	sender->wakeAtTime(fb->fNextVsync);
++}
++
++/*
++ * 0188: the present thread shows the frame the vsync tick handed over; the
++ * scale is split by panel rows between it and fWorkers-1 helper threads
++ * (boot-arg sweetfb_workers, default 4, 1 = no helpers).
++ */
++void
++AppleCLCD::presenterMain(void *arg, wait_result_t wr)
++{
++	AppleCLCD *fb = (AppleCLCD *)arg;
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++
++	(void)wr;
++	for (;;) {
++		IOLockLock(fb->fLock);
++		while (!fb->fPresentReady) {
++			IOLockSleep(fb->fLock, &fb->fPresentReady, THREAD_UNINT);
++		}
++		fb->fPresentReady = false;
++		memcpy(rec, fb->fPresentRec, SWEET_FB_SWAP_REC_SIZE);
++		IOLockUnlock(fb->fLock);
++		uint64_t t0 = mach_absolute_time();
++		fb->present(rec);
++		sweet_fb_stat_present(mach_absolute_time() - t0);
++		IOLockLock(fb->fLock);
++		fb->fPresentBusy = false;
++		IOLockUnlock(fb->fLock);
++	}
++}
++
++void
++AppleCLCD::workerMain(void *arg, wait_result_t wr)
++{
++	AppleCLCD *fb = ((AppleCLCD **)arg)[0];
++	uint32_t idx = *(uint32_t *)((uint8_t *)arg + sizeof(AppleCLCD *));
++	uint32_t seen = 0;
++
++	(void)wr;
++	for (;;) {
++		IOLockLock(fb->fJobLock);
++		while (fb->fJobGen == seen) {
++			IOLockSleep(fb->fJobLock, &fb->fJobGen, THREAD_UNINT);
++		}
++		seen = fb->fJobGen;
++		IOLockUnlock(fb->fJobLock);
++		fb->scaleRows(idx, fb->fWorkers, fb->fRowBuf[idx]);
++		IOLockLock(fb->fJobLock);
++		if (++fb->fJobDone == fb->fWorkers - 1) {
++			IOLockWakeup(fb->fJobLock, &fb->fJobDone, true);
++		}
++		IOLockUnlock(fb->fJobLock);
++	}
++}
++
++void
++AppleCLCD::startPresenter()
++{
++	uint32_t workers = 4;
++	thread_t th;
++
++	(void)PE_parse_boot_argn("sweetfb_workers", &workers, sizeof(workers));
++	if (workers < 1) {
++		workers = 1;
++	}
++	if (workers > SWEET_FB_WORKERS_MAX) {
++		workers = SWEET_FB_WORKERS_MAX;
++	}
++	fWorkers = 1;
++	if (!fScaled) {
++		workers = 1;
++	}
++	fJobLock = IOLockAlloc();
++	if (fJobLock == NULL) {
++		return;
++	}
++	for (uint32_t i = 0; i < workers; i++) {
++		fRowBuf[i] = (uint32_t *)IOMallocData((fLogicalW + 2) * sizeof(uint32_t));
++		if (fRowBuf[i] == NULL) {
++			IOLog("SWEET FB: no row buffer %u\n", i);
++			return;
++		}
++	}
++	if (kernel_thread_start(&AppleCLCD::presenterMain, this, &th) != KERN_SUCCESS) {
++		IOLog("SWEET FB: no present thread, presenting from vsync\n");
++		return;
++	}
++	thread_deallocate(th);
++	fPresenter = true;
++	for (uint32_t i = 1; i < workers; i++) {
++		fWorkerArg[i].fb = this;
++		fWorkerArg[i].idx = i;
++		if (kernel_thread_start(&AppleCLCD::workerMain, &fWorkerArg[i], &th) != KERN_SUCCESS) {
++			break;
++		}
++		thread_deallocate(th);
++		fWorkers = i + 1;
++	}
++	IOLog("SWEET FB: present thread + %u scale parts\n", fWorkers);
+ }
+ 
+ void
+@@ -742,18 +895,92 @@
+ 	uint32_t py1 = (uint32_t)(((uint64_t)(dy + h) * fHeight + fLogicalH - 1) / fLogicalH);
+ 	px1 = px1 > fWidth ? fWidth : px1;
+ 	py1 = py1 > fHeight ? fHeight : py1;
+-	const uint8_t *base = (const uint8_t *)(src + s->offset);
+-	for (uint32_t py = py0; py < py1; py++) {
++	if (px0 >= px1 || py0 >= py1) {
++		return;
++	}
++	fJob.base = (const uint8_t *)(src + s->offset);
++	fJob.bpr = s->bytesPerRow;
++	fJob.sx = sx;
++	fJob.sy = sy;
++	fJob.dx = dx;
++	fJob.dy = dy;
++	fJob.w = w;
++	fJob.h = h;
++	fJob.px0 = px0;
++	fJob.px1 = px1;
++	fJob.py0 = py0;
++	fJob.py1 = py1;
++	uint32_t parts = fWorkers;
++	if (parts <= 1 || fJobLock == NULL) {
++		scaleRows(0, 1, fRowBuf[0]);
++		return;
++	}
++	/* 0188: wake the helpers on a new job, do part 0, wait for the rest. */
++	IOLockLock(fJobLock);
++	fJobDone = 0;
++	fJobGen++;
++	IOLockWakeup(fJobLock, &fJobGen, false);
++	IOLockUnlock(fJobLock);
++	scaleRows(0, parts, fRowBuf[0]);
++	IOLockLock(fJobLock);
++	while (fJobDone < parts - 1) {
++		IOLockSleep(fJobLock, &fJobDone, THREAD_UNINT);
++	}
++	IOLockUnlock(fJobLock);
++}
++
++/* Two BGRA pixels at once: per-channel floor average, as sweet_fb_avg. */
++typedef uint64_t sweet_fb_u64u __attribute__((aligned(4), may_alias));
++
++static inline uint64_t
++sweet_fb_avg2(uint64_t a, uint64_t b)
++{
++	return (a & b) + (((a ^ b) & 0xfefefefefefefefeULL) >> 1);
++}
++
++/*
++ * 0188: panel rows [part/parts] of fJob. Each row first averages the two
++ * logical rows it covers into tmp (two pixels per step), then each panel
++ * pixel averages the two tmp columns it covers. Same 2x2 box as 0184, with
++ * the vertical average taken first (results differ by at most 1 per channel).
++ */
++void
++AppleCLCD::scaleRows(uint32_t part, uint32_t parts, uint32_t *tmp)
++{
++	uint32_t n = fJob.py1 - fJob.py0;
++	uint32_t a = fJob.py0 + (uint32_t)(((uint64_t)n * part) / parts);
++	uint32_t b = fJob.py0 + (uint32_t)(((uint64_t)n * (part + 1)) / parts);
++	int32_t dx = fJob.dx, dy = fJob.dy, w = fJob.w, h = fJob.h;
++	int32_t lxa = (int32_t)fScaleX[fJob.px0];
++	int32_t lxb = (int32_t)fScaleX[fJob.px1 - 1] + 1;
++	if (lxb > dx + w - 1) {
++		lxb = dx + w - 1;
++	}
++	int32_t cbase = fJob.sx + lxa - dx;
++	int32_t ncol = lxb - lxa + 1;   /* tmp[0..ncol) = columns cbase.. */
++
++	if (tmp == NULL || ncol <= 0 || ncol > (int32_t)fLogicalW + 2) {
++		return;
++	}
++	for (uint32_t py = a; py < b; py++) {
+ 		int32_t ly = (int32_t)(((uint64_t)py * fLogicalH) / fHeight);
+ 		int32_t ly2 = ly + 1 < dy + h ? ly + 1 : dy + h - 1;
+-		const uint32_t *r0 = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow);
+-		const uint32_t *r1 = (const uint32_t *)(base + (uint64_t)(sy + ly2 - dy) * s->bytesPerRow);
++		const uint32_t *r0 = (const uint32_t *)(fJob.base + (uint64_t)(fJob.sy + ly - dy) * fJob.bpr) + cbase;
++		const uint32_t *r1 = (const uint32_t *)(fJob.base + (uint64_t)(fJob.sy + ly2 - dy) * fJob.bpr) + cbase;
++		int32_t k = 0;
++		for (; k + 1 < ncol; k += 2) {
++			*(sweet_fb_u64u *)(tmp + k) = sweet_fb_avg2(*(const sweet_fb_u64u *)(r0 + k),
++			    *(const sweet_fb_u64u *)(r1 + k));
++		}
++		if (k < ncol) {
++			tmp[k] = sweet_fb_avg(r0[k], r1[k]);
++		}
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
+-		for (uint32_t px = px0; px < px1; px++) {
++		for (uint32_t px = fJob.px0; px < fJob.px1; px++) {
+ 			int32_t lx = (int32_t)fScaleX[px];
+-			int32_t c0 = sx + lx - dx;
+-			int32_t c1 = lx + 1 < dx + w ? c0 + 1 : c0;
+-			out[px] = sweet_fb_avg(sweet_fb_avg(r0[c0], r0[c1]), sweet_fb_avg(r1[c0], r1[c1]));
++			int32_t k0 = lx - lxa;
++			int32_t k1 = lx + 1 < dx + w ? k0 + 1 : k0;
++			out[px] = sweet_fb_avg(tmp[k0], tmp[k1]);
+ 		}
+ 	}
+ }
