@@ -7,6 +7,7 @@
 #   tools/mesa/mk-mesa-ios.sh OUT       OUT gets libOSMesa.8.dylib and libglapi.0.dylib, install names
 #                                       @rpath/... (the phone has them beside gl_test in /usr/local/bin: the
 #                                       kernel's file installer makes no directories), stripped (-x), ad-hoc signed
+# Size matters: the files ride inside the kernel image (32 MiB BOOT partition), so -Os and -dead_strip.
 set -euo pipefail
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
@@ -54,7 +55,8 @@ needs_exe_wrapper = true
 INI
 
 meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-	--prefix=/usr/local --libdir=lib --buildtype=release -Db_ndebug=true \
+	--prefix=/usr/local --libdir=lib --buildtype=release -Doptimization=s -Db_ndebug=true \
+	-Dc_link_args=-Wl,-dead_strip -Dcpp_link_args=-Wl,-dead_strip \
 	-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 	-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
