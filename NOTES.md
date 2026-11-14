@@ -196,6 +196,43 @@ BOOT p10, extra `sweetfb_hz=60 on7mali=1 on7malistep=4`; boot 18:50, same usblog
   a NULL job) and check JOB_IRQ_RAWSTAT done bit + the written value. After
   that: interrupt handler for SPI 281-283, then a user client for Mesa panfrost.
 
+**0191 RESULT (GPU step 3, first GPU jobs; xnu85 = 0187..0191,
+`scratchpad/build191.sh` as root; BOOT p10, extra `sweetfb_hz=60 on7mali=1
+on7malistep=6`; boot 19:06, same usblog):**
+- 0191 = `on7_mali_job_test()`, on7malistep 5 and 6. 8 physically contiguous
+  wired pages (IOBufferMemoryDescriptor, phys mask < 4 GB, cached, every
+  hand-over through `flush_dcache64(pa, len, TRUE)`): L0-L3 page tables, job
+  page, target page, 2 spare. Mali LPAE format as Linux panfrost
+  (io-pgtable ARM_MALI_LPAE): table entry `pa|3`, leaf `pa|1|attr1<<2|RD
+  bit6|WR bit7|SH 3<<8`, 4 levels from L0, TRANSTAB `L0|3|1<<2`, MEMATTR
+  0x888d88, AS0 UPDATE. 4 pages at GPU VA 0x01000000.
+- [O] step 5: AS0 TRANSTAB/MEMATTR read back as written, AS_STATUS idle at
+  once, no MMU fault.
+- First try (xnu84): one WRITE_VALUE job with type 6 = "immediate 32": job
+  DONE (exception 1), but the target read 0/0. Mesa genxml v5.xml (fetched
+  from the vcxsrv mirror with `gh`, gitlab.freedesktop.org blocks bots): v5
+  WRITE_VALUE types are only **1 cycle counter, 2 system timestamp, 3 zero**,
+  payload = Address u64 @0 + Type u32 @8. [I] unknown type 6 acts like zero.
+- [O] xnu85: chain of two WRITE_VALUE jobs on JS1 (job 1 cycle counter to
+  VA 0x01001000, Next = job 2 at +0x40, timestamp to VA 0x01001008), JS_CONFIG
+  AS0 | start/end flush clean+invalidate | pri 8. **Both jobs exception 1
+  (DONE), JOB_IRQ_RAWSTAT 2 (slot 1 done) after 1 poll, JS1_HEAD ended at
+  0x01000040 (chain walked), target = cycles 0x3abc08, timestamp
+  0x2b9a2e66** (prefill deadbeef/12345678 replaced). No MMU, GPU or job fault.
+  [O] The GPU also wrote the same timestamp into job 1's Fault Pointer field.
+- [O] Boot normal after it, no panic, SWEET FB presents unchanged (~9 ms).
+- [I] The T830 now reads its own page tables and job descriptors from RAM,
+  walks a job chain and writes results back that the CPU sees: the
+  memory/MMU/job path a Panfrost backend needs works from XNU.
+- NEXT (GPU step 4): (a) interrupt handler for SPI 282 JOB / 283 MMU / 281 GPU
+  instead of polling (IOInterruptEventSource on the GIC lines; check the
+  ADT/interrupt-controller numbering the port uses for other SPIs); (b) a
+  kernel user client (`HakiosMali`-style, from the a50 port's
+  `drivers/gpu/hakios.mali.cpp`) exposing BO alloc/mmap, GPU VA map and job
+  submit, so Mesa panfrost (via `tools/mali-drmshim`) can run a first
+  compute/fragment job from userland. Panfrost's T830 quirks
+  (L2_MMU_CONFIG external read/write limits, SHADER/TILER_CONFIG) still to apply.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is

@@ -1,0 +1,188 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>     /* 0191 */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -570,6 +571,166 @@
+ 	IOSleep(300);   /* let the USB log drain before touching the GPU */
+ }
+ 
++/*
++ * 0191: GPU step 3, on7malistep 5 and 6.
++ *   5 address space 0: 4-level Mali LPAE page table (the format Linux
++ *     panfrost uses for Midgard: io-pgtable ARM_MALI_LPAE; table entry type 3,
++ *     leaf type 1 at every level, RD bit 6, WR bit 7, attr index [4:2],
++ *     TRANSTAB = L0 | ADRMODE_TABLE 3 | READ_INNER bit 2,
++ *     MEMATTR = 0x888d88: idx0 impl-def, idx1 write-alloc, idx2 impl-def),
++ *     4 pages mapped at GPU VA 0x01000000, AS_COMMAND UPDATE.
++ *   6 one WRITE_VALUE job (job type 2, 64-bit descriptor, index 1) on job
++ *     slot 1, chained to a second one (cycle counter, then timestamp, to GPU VA 0x01001000),
++ *     JS_CONFIG = AS 0 | start + end cache clean/invalidate | thread pri 8.
++ * Memory: one physically contiguous wired buffer below 4 GB, kept forever.
++ * The GPU is not coherent with the CPU caches here, so every CPU write the GPU
++ * reads and every GPU write the CPU reads goes through flush_dcache64.
++ */
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++
++#define MALI_AS0                0x2400
++#define MALI_AS_TRANSTAB_LO     0x00
++#define MALI_AS_TRANSTAB_HI     0x04
++#define MALI_AS_MEMATTR_LO      0x08
++#define MALI_AS_MEMATTR_HI      0x0c
++#define MALI_AS_COMMAND         0x18
++#define MALI_AS_FAULTSTATUS     0x1c
++#define MALI_AS_FAULTADDR_LO    0x20
++#define MALI_AS_FAULTADDR_HI    0x24
++#define MALI_AS_STATUS          0x28
++#define MALI_AS_CMD_UPDATE      0x01
++#define MALI_JS1                0x1880
++#define MALI_JS_HEAD_LO         0x00
++#define MALI_JS_HEAD_HI         0x04
++#define MALI_JS_STATUS          0x24
++#define MALI_JS_HEAD_NEXT_LO    0x40
++#define MALI_JS_HEAD_NEXT_HI    0x44
++#define MALI_JS_AFFINITY_NEXT_LO 0x50
++#define MALI_JS_AFFINITY_NEXT_HI 0x54
++#define MALI_JS_CONFIG_NEXT     0x58
++#define MALI_JS_COMMAND_NEXT    0x60
++#define MALI_JS_CMD_START       0x01
++#define MALI_JS_CFG_START_FLUSH (3u << 8)
++#define MALI_JS_CFG_END_FLUSH   (3u << 12)
++#define MALI_JS_CFG_PRI(n)      ((uint32_t)(n) << 16)
++
++#define ON7_GPU_VA              0x01000000ULL
++#define ON7_PTE_TABLE           3ULL
++#define ON7_PTE_LEAF            (1ULL | (1ULL << 2) | (1ULL << 6) | (1ULL << 7) | (3ULL << 8))
++#define ON7_GPU_PAGES           8       /* L0 L1 L2 L3 job target spare spare */
++
++static IOBufferMemoryDescriptor *on7_gpu_mem;
++
++static void
++on7_mali_job_test(volatile uint32_t *gpu, int step)
++{
++	on7_mali_say("5 MMU address space 0");
++	on7_gpu_mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous, ON7_GPU_PAGES * 4096, 0x00000000fffff000ULL);
++	if (on7_gpu_mem == NULL) {
++		IOLog("ON7 MALI: no GPU memory\n");
++		return;
++	}
++	IOByteCount seglen = 0;
++	uint64_t pa = on7_gpu_mem->getPhysicalSegment(0, &seglen, kIOMemoryMapperNone);
++	uint8_t *va = (uint8_t *)on7_gpu_mem->getBytesNoCopy();
++	if (pa == 0 || seglen < ON7_GPU_PAGES * 4096 || (pa & 0xfff) != 0) {
++		IOLog("ON7 MALI: bad GPU memory pa %llx len %llx\n", pa, (uint64_t)seglen);
++		return;
++	}
++	bzero(va, ON7_GPU_PAGES * 4096);
++	uint64_t *l0 = (uint64_t *)(va + 0 * 4096);
++	uint64_t *l1 = (uint64_t *)(va + 1 * 4096);
++	uint64_t *l2 = (uint64_t *)(va + 2 * 4096);
++	uint64_t *l3 = (uint64_t *)(va + 3 * 4096);
++	l0[(ON7_GPU_VA >> 39) & 511] = (pa + 1 * 4096) | ON7_PTE_TABLE;
++	l1[(ON7_GPU_VA >> 30) & 511] = (pa + 2 * 4096) | ON7_PTE_TABLE;
++	l2[(ON7_GPU_VA >> 21) & 511] = (pa + 3 * 4096) | ON7_PTE_TABLE;
++	for (unsigned i = 0; i < 4; i++) {
++		l3[((ON7_GPU_VA >> 12) & 511) + i] = (pa + (4 + i) * 4096) | ON7_PTE_LEAF;
++	}
++	uint32_t *target = (uint32_t *)(va + 5 * 4096);
++	target[0] = 0xdeadbeefu;
++	target[1] = 0x12345678u;
++	flush_dcache64((addr64_t)pa, ON7_GPU_PAGES * 4096, TRUE);
++
++	volatile uint32_t *as = gpu + MALI_AS0 / 4;
++	uint32_t n = on7_poll(gpu, MALI_AS0 + MALI_AS_STATUS, 1, 0);
++	uint64_t transtab = pa | 3ULL | (1ULL << 2);
++	uint64_t memattr = 0x888d88ULL;
++	on7_wr(gpu, MALI_MMU_IRQ_CLEAR, 0xffffffffu);
++	as[MALI_AS_TRANSTAB_LO / 4] = (uint32_t)transtab;
++	as[MALI_AS_TRANSTAB_HI / 4] = (uint32_t)(transtab >> 32);
++	as[MALI_AS_MEMATTR_LO / 4] = (uint32_t)memattr;
++	as[MALI_AS_MEMATTR_HI / 4] = (uint32_t)(memattr >> 32);
++	on7_wr(gpu, MALI_AS0 + MALI_AS_COMMAND, MALI_AS_CMD_UPDATE);
++	uint32_t n2 = on7_poll(gpu, MALI_AS0 + MALI_AS_STATUS, 1, 0);
++	IOLog("ON7 MALI: AS0 pa %llx transtab %08x%08x memattr %08x%08x, idle wait %u/%u polls, as_status %08x faultstatus %08x mmu_raw %08x\n",
++	    pa, on7_rd(gpu, MALI_AS0 + MALI_AS_TRANSTAB_HI), on7_rd(gpu, MALI_AS0 + MALI_AS_TRANSTAB_LO),
++	    on7_rd(gpu, MALI_AS0 + MALI_AS_MEMATTR_HI), on7_rd(gpu, MALI_AS0 + MALI_AS_MEMATTR_LO),
++	    n, n2, on7_rd(gpu, MALI_AS0 + MALI_AS_STATUS), on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTSTATUS),
++	    on7_rd(gpu, MALI_MMU_IRQ_RAWSTAT));
++	if (n2 == ~0u || step < 6) {
++		return;
++	}
++
++	on7_mali_say("6 WRITE_VALUE job on slot 1");
++	uint32_t *job = (uint32_t *)(va + 4 * 4096);
++	uint64_t tva = ON7_GPU_VA + 0x1000;
++	/*
++	 * Midgard v5 WRITE_VALUE has no immediate types (Mesa genxml v5.xml:
++	 * 1 cycle counter, 2 system timestamp, 3 zero; a first try with 6 wrote
++	 * 64-bit zero). Chain of two jobs: job 1 at +0 writes the GPU cycle
++	 * counter to tva, job 2 at +0x40 (header Next of job 1) writes the
++	 * system timestamp to tva + 8. Both values are non-zero.
++	 */
++	job[4] = 1u | (2u << 1) | (1u << 16);  /* is_64b, type WRITE_VALUE, index 1 */
++	job[6] = (uint32_t)(ON7_GPU_VA + 0x40); /* next */
++	job[7] = (uint32_t)((ON7_GPU_VA + 0x40) >> 32);
++	job[8] = (uint32_t)tva;                 /* payload: address */
++	job[9] = (uint32_t)(tva >> 32);
++	job[10] = 1;                            /* type: cycle counter */
++	uint32_t *job2 = job + 0x40 / 4;
++	job2[4] = 1u | (2u << 1) | (2u << 16);  /* index 2 */
++	job2[8] = (uint32_t)(tva + 8);
++	job2[9] = (uint32_t)((tva + 8) >> 32);
++	job2[10] = 2;                           /* type: system timestamp */
++	target[2] = 0xdeadbeefu;
++	target[3] = 0x12345678u;
++	flush_dcache64((addr64_t)pa, ON7_GPU_PAGES * 4096, TRUE);
++
++	volatile uint32_t *js = gpu + MALI_JS1 / 4;
++	on7_wr(gpu, MALI_JOB_IRQ_CLEAR, 0xffffffffu);
++	js[MALI_JS_HEAD_NEXT_LO / 4] = (uint32_t)ON7_GPU_VA;
++	js[MALI_JS_HEAD_NEXT_HI / 4] = (uint32_t)(ON7_GPU_VA >> 32);
++	js[MALI_JS_AFFINITY_NEXT_LO / 4] = on7_rd(gpu, MALI_SHADER_PRESENT);
++	js[MALI_JS_AFFINITY_NEXT_HI / 4] = 0;
++	js[MALI_JS_CONFIG_NEXT / 4] = 0 | MALI_JS_CFG_START_FLUSH | MALI_JS_CFG_END_FLUSH | MALI_JS_CFG_PRI(8);
++	on7_wr(gpu, MALI_JS1 + MALI_JS_COMMAND_NEXT, MALI_JS_CMD_START);
++	/* slot 1: bit 1 done, bit 17 failed */
++	uint32_t raw = 0;
++	for (n = 0; n < 10000; n++) {
++		raw = on7_rd(gpu, MALI_JOB_IRQ_RAWSTAT);
++		if (raw & ((1u << 1) | (1u << 17))) {
++			break;
++		}
++		IODelay(10);
++	}
++	flush_dcache64((addr64_t)pa, ON7_GPU_PAGES * 4096, TRUE);
++	IOLog("ON7 MALI: job %s after %u polls, job_raw %08x js1_status %08x js1_head %08x%08x; descriptor exception %08x first_incomplete %08x fault %08x%08x\n",
++	    (raw & (1u << 17)) ? "FAILED" : (raw & (1u << 1)) ? "done" : "TIMEOUT", n, raw,
++	    on7_rd(gpu, MALI_JS1 + MALI_JS_STATUS), on7_rd(gpu, MALI_JS1 + MALI_JS_HEAD_HI),
++	    on7_rd(gpu, MALI_JS1 + MALI_JS_HEAD_LO), job[0], job[1], job[3], job[2]);
++	IOLog("ON7 MALI: job 2 exception %08x; cycles %08x%08x timestamp %08x%08x (were deadbeef 12345678)\n",
++	    job2[0], target[1], target[0], target[3], target[2]);
++	IOLog("ON7 MALI: job mmu_raw %08x as0 faultstatus %08x faultaddr %08x%08x gpu_raw %08x gpu_fault %08x\n",
++	    on7_rd(gpu, MALI_MMU_IRQ_RAWSTAT), on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTSTATUS),
++	    on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTADDR_HI), on7_rd(gpu, MALI_AS0 + MALI_AS_FAULTADDR_LO),
++	    on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT), on7_rd(gpu, MALI_GPU_FAULTSTATUS));
++	on7_wr(gpu, MALI_JOB_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_MMU_IRQ_CLEAR, 0xffffffffu);
++}
++
+ static void
+ on7_mali_steps(volatile uint32_t *gpu)
+ {
+@@ -645,6 +806,10 @@
+ 	    n == ~0u ? "TIMEOUT" : "done", n, on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT),
+ 	    on7_rd(gpu, MALI_GPU_STATUS), on7_rd(gpu, MALI_GPU_FAULTSTATUS));
+ 	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	if (n == ~0u || step < 5) {
++		return;
++	}
++	on7_mali_job_test(gpu, step);
+ }
+ 
+ static void
