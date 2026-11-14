@@ -1,0 +1,85 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -559,6 +559,61 @@
+ 	return true;
+ }
+ 
++/*
++ * 0187: how long a panel present takes (copy, or the 0184 scale) and how
++ * often swaps, presents and vsyncs happen. The vsync timer is re-armed after
++ * present(), so a slow present also lowers the vsync rate. One line every
++ * ~10 s while frames are presented:
++ *   SWEET FB: stat 10012 ms: swaps N presents N vsyncs N, present avg/max
++ *   US/US us, flush every N ticks, scaled 0|1
++ * Only the vsync callout (one work loop) and swap() touch these; the swap
++ * count is a plain counter, a lost increment does not matter here.
++ */
++static uint64_t sweet_fb_stat_start;
++static uint32_t sweet_fb_stat_swaps;
++static uint32_t sweet_fb_stat_presents;
++static uint32_t sweet_fb_stat_vsyncs;
++static uint64_t sweet_fb_stat_sum;
++static uint64_t sweet_fb_stat_max;
++
++static void
++sweet_fb_stat_present(uint64_t dt)
++{
++	sweet_fb_stat_presents++;
++	sweet_fb_stat_sum += dt;
++	if (dt > sweet_fb_stat_max) {
++		sweet_fb_stat_max = dt;
++	}
++}
++
++static void
++sweet_fb_stat_report(uint32_t flushTicks, bool scaled)
++{
++	uint64_t now = mach_absolute_time();
++	uint64_t ns;
++
++	sweet_fb_stat_vsyncs++;
++	if (sweet_fb_stat_start == 0) {
++		sweet_fb_stat_start = now;
++		return;
++	}
++	absolutetime_to_nanoseconds(now - sweet_fb_stat_start, &ns);
++	if (ns < 10000000000ULL) {
++		return;
++	}
++	if (sweet_fb_stat_presents != 0) {
++		uint64_t avg, max;
++		absolutetime_to_nanoseconds(sweet_fb_stat_sum / sweet_fb_stat_presents, &avg);
++		absolutetime_to_nanoseconds(sweet_fb_stat_max, &max);
++		IOLog("SWEET FB: stat %llu ms: swaps %u presents %u vsyncs %u, present avg/max %llu/%llu us, flush every %u ticks, scaled %d\n",
++		    ns / 1000000, sweet_fb_stat_swaps, sweet_fb_stat_presents, sweet_fb_stat_vsyncs,
++		    avg / 1000, max / 1000, flushTicks, scaled ? 1 : 0);
++	}
++	sweet_fb_stat_start = now;
++	sweet_fb_stat_swaps = sweet_fb_stat_presents = sweet_fb_stat_vsyncs = 0;
++	sweet_fb_stat_sum = sweet_fb_stat_max = 0;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -606,9 +661,12 @@
+ 	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
++		uint64_t t0 = mach_absolute_time();
+ 		fb->present(rec);
++		sweet_fb_stat_present(mach_absolute_time() - t0);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	sweet_fb_stat_report(fb->fFlushTicks, fb->fScaled);
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+@@ -716,6 +774,7 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	sweet_fb_stat_swaps++;
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}

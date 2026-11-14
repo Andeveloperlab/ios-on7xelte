@@ -102,6 +102,28 @@ swaps; boot it (BOOT p10 only) with sweetfb_hz=10, then 30, then 60 in the
 pipeline.ps1 cmdline and read the USB log + user's feel. That number decides
 whether NEON/multicore is enough or option 2 is needed next.
 
+**0187 RESULT (xnu80 = 0186 + 0187, local build `scratchpad/build187.sh`, run as
+`wsl -u root`; flashed BOOT p10 with extra boot-arg `sweetfb_hz=60`, boot 18:13,
+log `candidates/xnu14/usblog-20261114-154207-ts.txt` from 18:13:04):**
+- [O] Scaled full-frame present = **avg 33.8-35.9 ms, max 39.4 ms** in every 10 s
+  window (8 windows). So the CPU scale caps the panel at ~28 fps.
+- [O] Busiest window: swaps 62, presents 49, vsyncs 472 (idle windows: ~566).
+  Presents < swaps (coalesced while presenting); vsyncs drop ~100 because the timer
+  re-arms only after present() (49 x 35 ms = 1.7 s). Even idle gives ~566 not 600
+  (re-arm drift).
+- [O] CA swapped at most ~6/s during this use; earlier (xnu76, 10 Hz) ~26/s
+  [I: CA probably paces on our late vsyncs; not proven].
+- [O] PosterBoard sig 5 at ~150 s happens every boot (10x in this log before 0187),
+  unrelated.
+- [I] 35 ms / 2.07 Mpx at 1482 MHz = ~25 cycles per output pixel: scalar code,
+  4 loads + 3 averages per pixel. NEON (8 px per op) + 4 cores should reach a few
+  ms [G], which makes option 1 sufficient for the present path; option 2 only if
+  that fails.
+- NEXT: 0188 = present off the vsync callout (own thread, vsync timer re-armed
+  first, absolute deadline), scale split over 4 cores, NEON 2x2 average
+  (vhaddq_u8), then re-measure with the same stat line. Phone stays on xnu80
+  hz=60 until then.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
