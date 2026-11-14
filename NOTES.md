@@ -172,6 +172,30 @@ as root; BOOT p10, extra `sweetfb_hz=60 on7mali=1`; boot 18:43, usblog
   Mesa panfrost + eagl.c. G3D voltage (S2MPU05 BUCK2) can be read with the USB
   `pmic` command if a hang shows up under load.
 
+**0190 RESULT (GPU step 2, xnu83 = 0187..0190, `scratchpad/build190.sh` as root;
+BOOT p10, extra `sweetfb_hz=60 on7mali=1 on7malistep=4`; boot 18:50, same usblog):**
+- 0190 = `on7_mali_steps()` after the 0189 probe, boot-arg `on7malistep` N
+  (0 default = nothing; each step includes the earlier ones, logs + sleeps
+  300 ms before touching the GPU): 1 mask GPU/JOB/MMU IRQs + soft reset,
+  2 L2 PWRON, 3 tiler + shader PWRON, 4 cycle counter over 10 ms + CLEAN_CACHES.
+  Polls RAWSTAT, no interrupt handler yet. Patch chain checked (b189 + 0190 ==
+  built source).
+- [O] reset done at once (GPU_IRQ_RAWSTAT 0x100), GPU/JOB/MMU fault regs 0.
+- [O] L2_READY 1, then SHADER_READY 1 and TILER_READY 1, no PWRTRANS left,
+  RAWSTAT 0x600 (power changed single + all).
+- [O] **cycle counter 3797068 in 11070 us = 342 MHz** (matches the 343 MHz PLL),
+  TIMESTAMP 287823 in the same time = 26 MHz system timer.
+- [O] CLEAN_CACHES completed (RAWSTAT 0x20000), GPU_STATUS 0, FAULTSTATUS 0.
+  Cores left powered. Boot continued normally (same ReportCrash/OTACrashCopier
+  noise as other boots, no panic seen).
+- [I] The T830 is alive, clocked and takes commands from XNU. No voltage
+  change or PMU write needed so far (bootloader state).
+- NEXT (GPU step 3, 0191): one MMU address space (AS0: TRANSTAB, MEMATTR,
+  UPDATE command, LPAE-style Midgard page table in wired kernel memory),
+  map a few pages, then submit a trivial job on JS0 (a WRITE_VALUE job or
+  a NULL job) and check JOB_IRQ_RAWSTAT done bit + the written value. After
+  that: interrupt handler for SPI 281-283, then a user client for Mesa panfrost.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is

@@ -1,0 +1,166 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -498,6 +498,155 @@
+ 	    on7_rd(gpu, 0x160), on7_rd(gpu, 0x0a0));
+ }
+ 
++/*
++ * 0190: GPU step 2, boot-arg on7malistep=N (default 0 = nothing), each step
++ * includes the ones before it. Register offsets: Midgard (kbase r7p0
++ * mali_midg_regmap.h, Mesa panfrost). Every step logs and sleeps first so a hang
++ * shows in the USB log where it happened. All GPU IRQ masks stay 0: nothing in
++ * this kernel takes SPI 281-283 yet, the steps poll the RAWSTAT registers.
++ *   1 mask IRQs, soft reset, wait RESET_COMPLETED
++ *   2 L2 power on, wait L2_READY
++ *   3 tiler + shader cores power on, wait READY
++ *   4 cycle counter over 10 ms (= GPU clock), clean caches, wait done
++ */
++#define MALI_GPU_IRQ_RAWSTAT    0x020
++#define MALI_GPU_IRQ_CLEAR      0x024
++#define MALI_GPU_IRQ_MASK       0x028
++#define MALI_GPU_COMMAND        0x030
++#define MALI_GPU_STATUS         0x034
++#define MALI_GPU_FAULTSTATUS    0x03c
++#define MALI_CYCLE_COUNT_LO     0x090
++#define MALI_TIMESTAMP_LO       0x098
++#define MALI_SHADER_PRESENT     0x100
++#define MALI_TILER_PRESENT      0x110
++#define MALI_L2_PRESENT         0x120
++#define MALI_SHADER_READY       0x140
++#define MALI_TILER_READY        0x150
++#define MALI_L2_READY           0x160
++#define MALI_SHADER_PWRON       0x180
++#define MALI_TILER_PWRON        0x190
++#define MALI_L2_PWRON           0x1a0
++#define MALI_SHADER_PWRTRANS    0x200
++#define MALI_TILER_PWRTRANS     0x210
++#define MALI_L2_PWRTRANS        0x220
++#define MALI_JOB_IRQ_RAWSTAT    0x1000
++#define MALI_JOB_IRQ_CLEAR      0x1004
++#define MALI_JOB_IRQ_MASK       0x1008
++#define MALI_MMU_IRQ_RAWSTAT    0x2000
++#define MALI_MMU_IRQ_CLEAR      0x2004
++#define MALI_MMU_IRQ_MASK       0x2008
++#define MALI_CMD_SOFT_RESET     0x01
++#define MALI_CMD_CYCLE_START    0x05
++#define MALI_CMD_CYCLE_STOP     0x06
++#define MALI_CMD_CLEAN_CACHES   0x07
++#define MALI_IRQ_RESET_DONE     (1u << 8)
++#define MALI_IRQ_POWER_ALL      (1u << 10)
++#define MALI_IRQ_CLEAN_DONE     (1u << 17)
++
++static void
++on7_wr(volatile uint32_t *b, uint32_t off, uint32_t v)
++{
++	b[off / 4] = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* poll until (reg & mask) == want; returns polls used, or ~0u on timeout (~100 ms) */
++static uint32_t
++on7_poll(volatile uint32_t *b, uint32_t off, uint32_t mask, uint32_t want)
++{
++	for (uint32_t n = 0; n < 10000; n++) {
++		if ((on7_rd(b, off) & mask) == want) {
++			return n;
++		}
++		IODelay(10);
++	}
++	return ~0u;
++}
++
++static void
++on7_mali_say(const char *what)
++{
++	IOLog("ON7 MALI: step %s\n", what);
++	IOSleep(300);   /* let the USB log drain before touching the GPU */
++}
++
++static void
++on7_mali_steps(volatile uint32_t *gpu)
++{
++	int step = 0;
++	uint32_t n;
++
++	(void)PE_parse_boot_argn("on7malistep", &step, sizeof(step));
++	if (step <= 0) {
++		IOLog("ON7 MALI: on7malistep=0, stop here\n");
++		return;
++	}
++
++	on7_mali_say("1 soft reset");
++	on7_wr(gpu, MALI_GPU_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_JOB_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_MMU_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_SOFT_RESET);
++	n = on7_poll(gpu, MALI_GPU_IRQ_RAWSTAT, MALI_IRQ_RESET_DONE, MALI_IRQ_RESET_DONE);
++	IOLog("ON7 MALI: reset %s after %u polls, rawstat %08x status %08x fault %08x job_raw %08x mmu_raw %08x\n",
++	    n == ~0u ? "TIMEOUT" : "done", n, on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT), on7_rd(gpu, MALI_GPU_STATUS),
++	    on7_rd(gpu, MALI_GPU_FAULTSTATUS), on7_rd(gpu, MALI_JOB_IRQ_RAWSTAT), on7_rd(gpu, MALI_MMU_IRQ_RAWSTAT));
++	if (n == ~0u || step < 2) {
++		return;
++	}
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++
++	uint32_t l2 = on7_rd(gpu, MALI_L2_PRESENT);
++	uint32_t tiler = on7_rd(gpu, MALI_TILER_PRESENT);
++	uint32_t shader = on7_rd(gpu, MALI_SHADER_PRESENT);
++
++	on7_mali_say("2 L2 power on");
++	on7_wr(gpu, MALI_L2_PWRON, l2);
++	n = on7_poll(gpu, MALI_L2_READY, l2, l2);
++	IOLog("ON7 MALI: L2 %s after %u polls, ready %08x trans %08x rawstat %08x\n",
++	    n == ~0u ? "TIMEOUT" : "ready", n, on7_rd(gpu, MALI_L2_READY),
++	    on7_rd(gpu, MALI_L2_PWRTRANS), on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT));
++	if (n == ~0u || step < 3) {
++		return;
++	}
++
++	on7_mali_say("3 tiler + shader power on");
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_TILER_PWRON, tiler);
++	on7_wr(gpu, MALI_SHADER_PWRON, shader);
++	n = on7_poll(gpu, MALI_SHADER_READY, shader, shader);
++	uint32_t n2 = on7_poll(gpu, MALI_TILER_READY, tiler, tiler);
++	IOLog("ON7 MALI: shader %s (%u) tiler %s (%u): shader_ready %08x tiler_ready %08x trans %08x/%08x rawstat %08x status %08x\n",
++	    n == ~0u ? "TIMEOUT" : "ready", n, n2 == ~0u ? "TIMEOUT" : "ready", n2,
++	    on7_rd(gpu, MALI_SHADER_READY), on7_rd(gpu, MALI_TILER_READY),
++	    on7_rd(gpu, MALI_SHADER_PWRTRANS), on7_rd(gpu, MALI_TILER_PWRTRANS),
++	    on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT), on7_rd(gpu, MALI_GPU_STATUS));
++	if (n == ~0u || n2 == ~0u || step < 4) {
++		return;
++	}
++
++	on7_mali_say("4 cycle counter + clean caches");
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_CYCLE_START);
++	IODelay(100);
++	uint32_t c0 = on7_rd(gpu, MALI_CYCLE_COUNT_LO), t0 = on7_rd(gpu, MALI_TIMESTAMP_LO);
++	uint64_t a0 = mach_absolute_time();
++	IODelay(10000);
++	uint32_t c1 = on7_rd(gpu, MALI_CYCLE_COUNT_LO), t1 = on7_rd(gpu, MALI_TIMESTAMP_LO);
++	uint64_t a1 = mach_absolute_time(), ns;
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_CYCLE_STOP);
++	absolutetime_to_nanoseconds(a1 - a0, &ns);
++	IOLog("ON7 MALI: cycles %u timestamp %u in %llu us -> GPU clock ~%llu MHz\n",
++	    c1 - c0, t1 - t0, ns / 1000, ns ? (uint64_t)(c1 - c0) * 1000ULL / ns : 0ULL);
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_CLEAN_CACHES);
++	n = on7_poll(gpu, MALI_GPU_IRQ_RAWSTAT, MALI_IRQ_CLEAN_DONE, MALI_IRQ_CLEAN_DONE);
++	IOLog("ON7 MALI: clean caches %s after %u polls, rawstat %08x status %08x fault %08x; GPU is up, cores stay on\n",
++	    n == ~0u ? "TIMEOUT" : "done", n, on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT),
++	    on7_rd(gpu, MALI_GPU_STATUS), on7_rd(gpu, MALI_GPU_FAULTSTATUS));
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++}
++
+ static void
+ on7_mali_probe(void *arg, wait_result_t wr)
+ {
+@@ -555,6 +704,7 @@
+ 		cmu[0x808 / 4] |= 0x1u;
+ 	}
+ 	on7_mali_regs(cmu, gpu);
++	on7_mali_steps(gpu);
+ }
+ 
+ static void
