@@ -320,6 +320,46 @@ on7malistep=9`; boot 22:35, same usblog):**
   ask the user before touching userdata), then Mesa panfrost through
   `tools/mali-drmshim` (T830 = Midgard v5 in Mesa's panfrost).
 
+**0194 PREPARED (GPU step 6, userland smoke test; NOT yet booted, waits for
+the user's OK because it writes two files into the iOS root on userdata):**
+- [O] Why not the old chunk write: the phone's root has been used read-write
+  by iOS since tweak5 (saved Wi-Fi network, prefs, logs), so writing 128 MiB
+  chunks of a CI image would put stale HFS+ catalog/bitmap blocks under live
+  data = corruption. Files go in through the mounted volume instead.
+- `tools/mali_test/mali_test.c` (commit f7b23e0): a50 mali_test for the J7:
+  waits up to 90 s for HakiosMali, GET_PARAM x11, CREATE_BO 16 KB + MMAP_BO +
+  IOConnectMapMemory64, one WRITE_VALUE job (fresh descriptor each time),
+  then 1000 more for the round trip, GEM_CLOSE. Logs via kern.on7xelte_wifi
+  "log" in 80-byte pieces -> USB log lines `USB> on7wifid: mt: ...`.
+- `sweet-root-tweaks.py --mali-test DIR` + root-tweak.yml input `mali_test`:
+  installs /usr/local/bin/mali_test and launchd job com.on7xelte.malitest
+  (root, RunAtLoad, LaunchOnlyOnce, no KeepAlive) and uploads artifact
+  `ios-root-files` (launchd.plist.before/.after + mali_test). CI run
+  43634883047 success. [O] launchd.plist.before (794235 bytes, sha256
+  bd307c2e...) is byte-identical to the copy inside tweak5's c92.gz at
+  0x6e000 (= what the phone got); .after (794425, 669bbb0c...) only adds
+  the malitest job. mali_test 70192 bytes, sha256 fd630369..., ad-hoc signed
+  with on7wifid-ents.plist. Its chunk output must NOT be written to the phone.
+- 0194 (`xnu/patches/0194-on7xelte-on7put-root-file-installer.patch`,
+  bsd_init.c): at the end of bsd_init (root mounted rw, before launchd), only
+  with boot-arg `on7put=1`, writes the files of `bsd/kern/on7put_payload.h`
+  through the HFS+ driver (vnode_open O_TRUNC, vn_rdwr IO_SYNC, fsync), sets
+  the mode (uid/gid 0 only for new files; launchd.plist stays 0:80), reads
+  back and compares (FNV-1a 64 + size). A file with a "before" hash that is
+  neither before nor the payload is LEFT ALONE; launchd.plist is first copied
+  to launchd.plist.pre-malitest. Already-installed files are skipped, so the
+  boot-arg may stay. Log lines `ON7 PUT: ...`. Without the header (CI builds)
+  it does nothing.
+- `tools/on7put-payload.py` makes the header (it holds Apple's launchd.plist:
+  local builds only, never commit). xnu89 = xnu88 + 0194 + payload
+  `malitest-43634883047`, `scratchpad/build194.sh`, sha256 03a924d5...e549,
+  `candidates/xnu89.kernel`; both payload files found in the image.
+- NEXT (needs the user's yes): flash xnu89 with extra
+  `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1`; expect `ON7 PUT: ...
+  written ... read back ok` x2 + backup line, then after HakiosMali
+  registers, `mt:` lines from launchd's com.on7xelte.malitest. Undo: copy
+  launchd.plist.pre-malitest back (or a later on7put payload that does it).
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
