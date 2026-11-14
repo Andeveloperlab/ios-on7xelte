@@ -474,6 +474,58 @@ waits for the user's OK: it writes 3 files into the iOS root on userdata):**
   the J7's HakiosMali does not have yet) / CoreAnimation via the a50's
   eagl/OSMesa approach.
 
+**WHY THE FILL IS SLOW + GPU DVFS PREPARED (0195, xnu94; NOT yet booted, waits
+for the user's OK: it raises the GPU voltage and clock):**
+- [O] The GPU runs at 343 MHz (0189/0190: G3D_PLL 0xa1570d01, cycle counter
+  342 MHz). The ECT in the phone's bootloader (`backup-on7xelte-2026-11-08/
+  mmcblk0boot0.img`, PARA at byte 183296, version 1001; parser
+  `scratchpad/ect.py` after the 3.18 kernel's ect_parser.c) says 343 MHz is
+  dvfs_g3d's boot AND lowest level; max 1001 MHz (1146-1300 disabled).
+  dvfs_mif boot level 0 = 902 MHz: memory is already at its top level.
+- [I] The fill numbers fit 343 MHz and ~1 pixel/clock: clear+1 flat layer
+  minus clear = 5.7 ms for 2.07 Mpixel = 364 Mpixel/s; a textured+blended
+  layer 16 ms = 128 Mpixel/s (~2.7 clocks/pixel). Extra opaque layers are
+  nearly free (forward pixel kill). The "one small rectangle, no clear"
+  frame (9.3 ms) is NOT a fixed submit cost: without a clear every tile is
+  reloaded from memory (8.3 MB) and written back. The real per-frame fixed
+  cost is <=1.1 ms (64x64 frames).
+- [I] Not the texture layout: hakios-drm announces panfrost 1.2 and the
+  kernel answers AFBC_FEATURES 0, so Mesa uses AFBC/u-interleaved, not
+  linear (not checked with PAN_MESA_DEBUG on the phone).
+- ECT dvfs_g3d (G3D_PLL P/M/S; BUCK2 = highest of all 16 ASV groups and all
+  7 table versions; bus div 0 / apb div 3 at every level):
+  | MHz  | P  | M   | S | BUCK2 uV |
+  | 1001 | 4  | 154 | 0 | 1006250  |
+  |  845 | 4  | 130 | 0 |  925000  |
+  |  728 | 4  | 112 | 0 |  875000  |
+  |  676 | 4  | 104 | 0 |  812500  |
+  |  545 | 13 | 545 | 1 |  750000  |
+  |  450 | 13 | 450 | 1 |  750000  |
+  |  343 | 13 | 343 | 1 |  750000  |
+  vdd_g3d = S2MPU05 BUCK2 (gpu_exynos7870.c regulator_get "BUCK2"; vsel
+  B2CTRL2 0x1d, same 400 mV + 6.25 mV steps as BUCK1). G3D EMA from
+  S5E7870-asv.c dfsg3d_set_ema, fuse-less defaults 0x12/0x12/0x22 (>=750 mV).
+- 0195 (commit 79c9501, in `bsd/dev/a5xelte_dvfs.c`, `scratchpad/b195`,
+  `g195.py`): USB command `gpufreq` (show G3D_PLL, mux, divs, EMA, BUCK2,
+  temperature) and `gpufreq MHZ` (up: BUCK2, EMA, PLL; down: PLL, EMA,
+  BUCK2; PLL relock on the 26 MHz oscillator like cpufreq, old setting back
+  if it does not lock; refuses with the G3D domain off, BUCK2 outside
+  550-1100 mV, or > 545 MHz at >= 80 C). Boot-arg `a5gpufreq=MHZ` posts it at
+  USB tick 10 (~14 s, before on7mali's probe at ~20 s, so step 4's cycle
+  counter shows the new clock). Thermal guard: > 545 MHz and >= 85 C ->
+  343 MHz. BUCK2 is clamped to 1.05 V.
+- xnu94 = xnu93 + 0195 (`scratchpad/build198.sh`, same payload
+  `glfill-43643435934`, all 3 files already on the phone), 19 528 048 bytes,
+  sha256 076f5c52..., `candidates/xnu94.kernel`; local build, no warnings.
+- NEXT (needs the user's yes): flash xnu94 with extra boot-args
+  `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1 a5gpufreq=N`. Expect
+  `USB> gpufreq: a5gpufreq=N`, `gpufreq: N000 kHz at ... uV (G3D_PLL ...)`,
+  then `ON7 MALI: ... GPU clock ~N MHz`, gl_test fill ~N/343 times faster.
+  Risks [G]: GPU hang at the new clock (HakiosMali resets after 1 s, gl_test
+  gives up after 120 s); a wrong BUCK2 assumption shows in the `gpufreq`
+  show line first (vsel should read ~0.6-0.75 V at 343 MHz). Undo: boot
+  without a5gpufreq (the PLL and BUCK2 reset with the board).
+
 **FULL-SCREEN FILL TIMING ON THE T830 (xnu93, boot 00:38 local 2026-11-15, same
 extra boot-args, usblog `candidates/xnu14/usblog-20261114-154207-ts.txt`):**
 - gl_test step 5 (commit 7a7087c, CI run 43643435934): after the a50's
