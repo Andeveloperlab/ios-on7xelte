@@ -360,6 +360,33 @@ the user's OK because it writes two files into the iOS root on userdata):**
   registers, `mt:` lines from launchd's com.on7xelte.malitest. Undo: copy
   launchd.plist.pre-malitest back (or a later on7put payload that does it).
 
+**0194 RESULT (xnu89 flashed to BOOT p10 with the user's OK, extra
+`sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1`, boot 23:23, usblog
+`candidates/xnu14/usblog-20261114-154207-ts.txt`):**
+- [O] `ON7 PUT: payload malitest-43634883047, 2 files`; mali_test written
+  70192 bytes 0755, read back ok; launchd.plist backed up to
+  `launchd.plist.pre-malitest` (794235 bytes) then written 794425 bytes,
+  read back ok (at 1.2-1.7 s, before launchd). Boot normal.
+- [O] launchd ran com.on7xelte.malitest at 11.8 s (pid 33, uid 0); it waited
+  for HakiosMali (registered 22.7 s), then: open ok; GET_PARAM = the kernel's
+  values (0x830, rev 0x10, AS 0xff, JS 7, MMU 0x2821, coherency 0, groups 1,
+  TLS 0x100); CREATE_BO 16 KB at GPU 0x2020000 mapped at 0x100d48000; the
+  WRITE_VALUE job (type 6 imm32 0xc0ffee01 -> +0x800) was job 203, wait 0,
+  WAIT_BO 0, **status word 0x1 (DONE) but the target word stayed 0** -> FAILED;
+  buffer given back 0. So a user process drives the GPU through IOKit end to
+  end; only the written value is missing.
+- [I] The user mapping does show GPU writes (the DONE status landed in the
+  same 4 KB page), so it is not the CPU mapping. The kernel's own tests only
+  used WRITE_VALUE types 1/2/3. [G] T830 may not do the immediate types (or
+  writes them elsewhere).
+- Prepared (not booted): mali_test with a type matrix (types 1-7, target
+  pre-filled 0xa5a5a5a5, both words printed, `mt: 4t:` lines), built by the new
+  `.github/workflows/userland.yml` (push of tools/mali_test; run 43637496121,
+  70240 bytes, sha256 64305371...). xnu90 = xnu89 code + payload
+  `malitest-43637496121` (mali_test replaced; launchd.plist already = payload
+  -> skipped), `candidates/xnu90.kernel` sha256 109afac3...053b.
+- NEXT: flash xnu90 with the same extra boot-args; read `mt: 4t:` lines.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
