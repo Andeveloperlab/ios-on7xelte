@@ -1,0 +1,68 @@
+name: mesa
+
+# Mesa's OSMesa with panfrost (Midgard v5, the J7 Prime's Mali-T830) and softpipe for iOS arm64
+# (tools/mesa/mk-mesa-ios.sh), and the programs that use it (tools/gl_test, tools/mali_test, which
+# runs gl_test). Output: artifact "gpu-userland", for the kernel's file installer (xnu 0194, on7put).
+
+on:
+  # workflow_dispatch needs the file on the default branch; a push of the sources runs it on any branch
+  push:
+    paths:
+      - tools/mesa/**
+      - tools/gl_test/**
+      - .github/workflows/mesa.yml
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: GitHub runner label (macos-15-intel when arm64 runners are out of capacity)
+        default: macos-15
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install bison flex ninja
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+
+      - name: Mesa
+        run: |
+          set -eux
+          bison --version | head -1
+          WORK=$RUNNER_TEMP/mesa bash tools/mesa/mk-mesa-ios.sh out/lib
+
+      - name: Programs
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDK -arch arm64 -miphoneos-version-min=16.0"
+          mkdir -p out/bin
+          $CC -O2 -Wall -Werror -o out/bin/gl_test tools/gl_test/gl_test.c \
+            out/lib/*.dylib
+          $CC -O2 -Wall -Werror -framework IOKit -o out/bin/mali_test tools/mali_test/mali_test.c
+          for f in out/bin/*; do codesign -f -s - --entitlements tools/on7wifid/on7wifid-ents.plist $f; done
+          otool -L out/bin/gl_test
+          ls -l out/bin out/lib
+          shasum -a 256 out/bin/* out/lib/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-userland
+          path: out
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mesa-logs
+          path: |
+            ${{ runner.temp }}/mesa/build/meson-logs
+          retention-days: 7

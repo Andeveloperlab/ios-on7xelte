@@ -14,10 +14,13 @@
  *      SUBMIT, wait by number (0x7d) and by buffer (WAIT_BO), the target checked; then ROUNDS more jobs
  *      (default 1000) for the round-trip time
  *   5  the buffer given back (GEM_CLOSE)
+ *   6  /usr/local/bin/gl_test (tools/gl_test: Mesa's panfrost through the same service), when it is
+ *      installed, run and waited for; its exit status logged
  *
  *   mali_test [ROUNDS]     (launchd job com.on7xelte.malitest runs it once at boot)
  */
 #include <IOKit/IOKitLib.h>
+#include <errno.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdarg.h>
@@ -25,7 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <spawn.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 enum {
@@ -168,6 +173,34 @@ one_job(mach_vm_address_t base, const struct create_bo *bo, uint32_t value, int 
 	return written;
 }
 
+/* 6: Mesa's turn, in a process of its own (it opens HakiosMali itself), once this one has let go */
+static void
+run_gl_test(void)
+{
+	static const char path[] = "/usr/local/bin/gl_test";
+	char *const args[] = { (char *)path, NULL };
+	extern char **environ;
+	pid_t pid;
+	int status = 0, err;
+
+	if (access(path, X_OK) != 0) {
+		say("6: no %s", path);
+		return;
+	}
+	if ((err = posix_spawn(&pid, path, NULL, NULL, args, environ)) != 0) {
+		say("6: %s would not start: errno %d", path, err);
+		return;
+	}
+	say("6: %s started, pid %d", path, pid);
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+	}
+	if (WIFSIGNALED(status)) {
+		say("6: gl_test killed by signal %d", WTERMSIG(status));
+	} else {
+		say("6: gl_test exit %d", WEXITSTATUS(status));
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -243,5 +276,6 @@ main(int argc, char **argv)
 	kr = request(kDrmGemClose, &gc, sizeof(gc));
 	say("5: buffer given back: %#x; %s", kr, good == rounds ? "ALL OK" : "FAILED");
 	IOServiceClose(gpu);
+	run_gl_test();
 	return good == rounds ? 0 : 1;
 }

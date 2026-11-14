@@ -1,0 +1,32 @@
+--- a/src/gallium/drivers/panfrost/pan_device.c
++++ b/src/gallium/drivers/panfrost/pan_device.c
+@@ -30,6 +30,7 @@
+ #include "util/hash_table.h"
+ #include "util/macros.h"
+ #include "util/u_math.h"
++#include "util/u_debug.h"
+ #include "util/u_thread.h"
+ #include "pan_bo.h"
+ #include "pan_device.h"
+@@ -118,8 +119,21 @@
+     */
+ 
+    if (dev->arch < 10) {
++#ifdef __APPLE__
++      /* The kernel's driver (HakiosMali, src/hakios-drm) has no growable
++       * buffers: every buffer is wired in full from the start. 128 MB of a
++       * small phone's memory for a heap that rarely holds more than a few MB
++       * is too much; PAN_TILER_HEAP_MB says how much (default 32).
++       */
++      unsigned heap = (unsigned)debug_get_num_option("PAN_TILER_HEAP_MB", 32);
++      if (heap < 4 || heap > 128)
++         heap = 32;
++      dev->tiler_heap = panfrost_bo_create(
++         dev, heap * 1024 * 1024, PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
++#else
+       dev->tiler_heap = panfrost_bo_create(
+          dev, 128 * 1024 * 1024, PAN_BO_INVISIBLE | PAN_BO_GROWABLE, "Tiler heap");
++#endif
+       if (!dev->tiler_heap)
+          goto err_free_kmod_dev;
+    }
