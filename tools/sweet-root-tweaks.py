@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR] [--wifi-fw DIR] [--wifid DIR]
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--hal-plugin DIR] [--wifi-fw DIR] [--wifid DIR] [--mali-test DIR]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -41,6 +41,11 @@ screen (image versions v8-v14 in NOTES.md):
                   of the saved network at boot and en0's DHCP lease + DNS in
                   configd's store. Remove the job from launchd.plist (or copy
                   launchd.plist.orig back) to turn it off
+  GPU smoke test  with --mali-test DIR (on7xelte, xnu 0193): DIR/mali_test
+                  (tools/mali_test) as /usr/local/bin/mali_test and the launchd
+                  job com.on7xelte.malitest (root, once at load, not kept
+                  alive): HakiosMali from a user process, results in the
+                  kernel log ("USB> on7wifid: mt: ...")
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
@@ -189,25 +194,45 @@ def wifi_fw(root, fwdir):
         print('wifi firmware installed: %s (%d bytes)' % (out[len(root):], os.path.getsize(out)))
 
 
-def wifid(root, d):
+def local_tool(root, d, name):
+    """DIR/NAME as /usr/local/bin/NAME (root, 0755)."""
     bindir = os.path.join(root, 'usr/local/bin')
     os.makedirs(bindir, exist_ok=True)
     for x in (os.path.join(root, 'usr/local'), bindir):
         os.chown(x, 0, 0)
         os.chmod(x, 0o755)
-    exe = os.path.join(bindir, 'on7wifid')
-    shutil.copyfile(os.path.join(d, 'on7wifid'), exe)
+    exe = os.path.join(bindir, name)
+    shutil.copyfile(os.path.join(d, name), exe)
     os.chown(exe, 0, 0)
     os.chmod(exe, 0o755)
+    return exe
+
+
+def add_job(root, label, job):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
     plist = load(path)
-    plist['LaunchDaemons']['/System/Library/LaunchDaemons/com.on7xelte.wifid.plist'] = {
-        'Label': 'com.on7xelte.wifid', 'ProgramArguments': ['/usr/local/bin/on7wifid'],
-        'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10, 'UserName': 'root',
-        'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'}
+    plist['LaunchDaemons']['/System/Library/LaunchDaemons/%s.plist' % label] = dict(job, Label=label)
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+
+
+def wifid(root, d):
+    exe = local_tool(root, d, 'on7wifid')
+    add_job(root, 'com.on7xelte.wifid', {
+        'ProgramArguments': ['/usr/local/bin/on7wifid'],
+        'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10, 'UserName': 'root',
+        'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
     print('on7wifid installed: /usr/local/bin/on7wifid (%d bytes), launchd job com.on7xelte.wifid added'
+          % os.path.getsize(exe))
+
+
+def mali_test(root, d):
+    exe = local_tool(root, d, 'mali_test')
+    add_job(root, 'com.on7xelte.malitest', {
+        'ProgramArguments': ['/usr/local/bin/mali_test'],
+        'RunAtLoad': True, 'KeepAlive': False, 'LaunchOnlyOnce': True, 'UserName': 'root',
+        'StandardOutPath': '/dev/null', 'StandardErrorPath': '/dev/null'})
+    print('mali_test installed: /usr/local/bin/mali_test (%d bytes), launchd job com.on7xelte.malitest added'
           % os.path.getsize(exe))
 
 
@@ -230,9 +255,11 @@ def audio(root, plugdir=None):
 
 def main():
     args = sys.argv[1:]
-    plugdir = fwdir = wifiddir = None
-    while len(args) >= 3 and args[-2] in ('--hal-plugin', '--wifi-fw', '--wifid'):
-        if args[-2] == '--hal-plugin':
+    plugdir = fwdir = wifiddir = malidir = None
+    while len(args) >= 3 and args[-2] in ('--hal-plugin', '--wifi-fw', '--wifid', '--mali-test'):
+        if args[-2] == '--mali-test':
+            malidir = args[-1]
+        elif args[-2] == '--hal-plugin':
             plugdir = args[-1]
         elif args[-2] == '--wifid':
             wifiddir = args[-1]
@@ -250,6 +277,8 @@ def main():
         wifi_fw(root, fwdir)
     if wifiddir:
         wifid(root, wifiddir)
+    if malidir:
+        mali_test(root, malidir)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})

@@ -26,6 +26,10 @@ on:
         description: "install on7wifid + its launchd job: Wi-Fi auto-join and DNS (xnu 0178)"
         type: boolean
         default: true
+      mali_test:
+        description: "install tools/mali_test + launchd job com.on7xelte.malitest (xnu 0193); also uploads ios-root-files (launchd.plist before/after + mali_test) for the kernel installer (0194)"
+        type: boolean
+        default: false
       runner:
         description: GitHub runner label (macos-15-intel when arm64 runners are out of capacity)
         default: macos-15
@@ -94,6 +98,17 @@ jobs:
           codesign -d --entitlements - work/wifid/on7wifid
           file work/wifid/on7wifid
 
+      - name: Build mali_test
+        if: ${{ inputs.mali_test }}
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDK -arch arm64 -miphoneos-version-min=16.0"
+          mkdir -p work/mali
+          $CC -O2 -Wall -Werror -framework IOKit -o work/mali/mali_test tools/mali_test/mali_test.c
+          codesign -f -s - --entitlements tools/on7wifid/on7wifid-ents.plist work/mali/mali_test
+          file work/mali/mali_test
+
       # The phone's own Android Wi-Fi files, from the public on7xelte vendor tree at a fixed commit,
       # checked by hash; they only pass through the runner into the image, never into this repository.
       - name: Fetch the Wi-Fi firmware
@@ -119,7 +134,23 @@ jobs:
           if [ "${{ inputs.wifid }}" = "true" ]; then plug="$plug --wifid work/wifid"; fi
           hdiutil attach -owners on -imagekey diskimage-class=CRawDiskImage \
             -mountpoint work/root work/ios-root.img
-          sudo python3 tools/sweet-root-tweaks.py work/root $plug | tee work/tweak.log
+          if [ "${{ inputs.mali_test }}" = "true" ]; then
+            # the root as it is without mali_test (= what the phone has), then with it
+            sudo python3 tools/sweet-root-tweaks.py work/root $plug | tee work/tweak.log
+            mkdir -p work/files
+            sudo cp work/root/System/Library/xpc/launchd.plist work/files/launchd.plist.before
+            plug="$plug --mali-test work/mali"
+          fi
+          sudo python3 tools/sweet-root-tweaks.py work/root $plug | tee -a work/tweak.log
+          if [ "${{ inputs.mali_test }}" = "true" ]; then
+            grep -q 'launchd job com.on7xelte.malitest added' work/tweak.log
+            sudo cp work/root/System/Library/xpc/launchd.plist work/files/launchd.plist.after
+            sudo ls -ln work/root/usr/local/bin work/root/System/Library/xpc/launchd.plist
+            cp work/mali/mali_test work/files/
+            sudo chown -R "$(id -u)" work/files
+            sudo plutil -p work/files/launchd.plist.after | grep -A8 com.on7xelte.malitest
+            shasum -a 256 work/files/*
+          fi
           if [ "${{ inputs.wifi_fw }}" = "true" ]; then
             grep -q 'bcm43430a1-sdio.bin' work/tweak.log
             sudo ls -lnR work/root/usr/share/firmware/wifi/on7xelte
@@ -144,6 +175,13 @@ jobs:
                 awk 'NR==1{print $1}')
           sudo fsck_hfs -f -n "$dev"
           hdiutil detach "$dev"
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.mali_test }}
+        with:
+          name: ios-root-files
+          path: work/files
+          retention-days: 14
 
       - name: Changed chunks
         run: |
