@@ -447,6 +447,33 @@ waits for the user's OK: it writes 3 files into the iOS root on userdata):**
   (`gl!` lines say), a GPU fault/hang (kernel resets after 1 s; gl_test
   gives up after 60 s). Undo: none needed (3 extra files in /usr/local/bin).
 
+**MILESTONE: FIRST MESA/PANFROST DRAWING ON THE T830 (xnu92, boot 00:28 local
+2026-11-15, extra `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1`, usblog
+`candidates/xnu14/usblog-20261114-154207-ts.txt`):**
+- xnu91 (flashed after the user's yes): ON7 PUT wrote all 3 files (lib
+  `written 11239008 bytes (inflated) ... read back ok`, 2 s), mali_test ALL
+  OK, but gl_test SIGABRT after 10 ms: [O] dyld `Library not loaded:
+  @rpath/libOSMesa.8.dylib ... (security policy does not allow @ path
+  expansion)`. Fix (commit 61241a2, CI run 43642675621): gl_test loads
+  `/usr/local/bin/libOSMesa.8.dylib` by absolute path (install_name_tool).
+- xnu92 = xnu91 code + payload `glmesa-43642675621` (only gl_test new; sha256
+  805b3bc5...c413, `candidates/xnu92.kernel`, `scratchpad/build196.sh`).
+  ON7 PUT: mali_test and the lib "already the payload", gl_test written.
+- [O] gl_test (pid 93, spawned by mali_test):
+  `context in 90.7 ms: Mesa | Mali-T830 (Panfrost) | OpenGL ES 3.1 Mesa 25.0.7`;
+  clear red 2.15 ms, pixels ff0000ff everywhere; triangle 1.23 ms, corner
+  000040ff (clear), centre 464b6eff, near red e00a14ff, near green 0ae014ff,
+  near blue 0a0fe6ff, the 16x16 letter picture is a correct R/G/B triangle;
+  100 frames (64x64 clear + triangle + glFinish) 1.017 ms each; `ALL OK`,
+  exit 0; 207 job chains, no faults/resets; boot went on normally
+  (backboardd, Wi-Fi). No `gl!` (Mesa stderr) lines.
+- [I] The whole stack works: Mesa 25.0.7 panfrost (Midgard v5) -> hakios-drm
+  -> HakiosMali (0193) -> the Mali-T830, from a normal root process.
+- NEXT ideas: bigger frames (1080x1920 fill timing like the a50's
+  `gl_test fill`), then a path to the screen (IOSurface import 0x7e, which
+  the J7's HakiosMali does not have yet) / CoreAnimation via the a50's
+  eagl/OSMesa approach.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
