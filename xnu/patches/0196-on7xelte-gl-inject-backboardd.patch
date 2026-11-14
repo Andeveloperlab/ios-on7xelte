@@ -1,0 +1,174 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,24 @@
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * 0196 (boot-arg on7gl=1): backboardd starts with DYLD_INSERT_LIBRARIES=/usr/local/bin/
++ * libon7gl.dylib added after its own environment (launchd passes no DYLD_ variables from a job;
++ * after the Galaxy A50 port's exec_inject_env). dyld honours it because sweet_amfi.c answers
++ * backboardd's dyld policy request with "allow all" under the same boot-arg.
++ */
++static TUNABLE(uint32_t, on7gl_exec, "on7gl", 0);
++static const char on7gl_exec_env[] = "DYLD_INSERT_LIBRARIES=/usr/local/bin/libon7gl.dylib";
++
++static bool
++on7gl_exec_wanted(struct image_params *imgp)
++{
++	return on7gl_exec && imgp->ip_ndp != NULL && imgp->ip_ndp->ni_cnd.cn_namelen == 10 &&
++	       strncmp(imgp->ip_ndp->ni_cnd.cn_nameptr, "backboardd", 10) == 0;
++}
++#endif
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5759,22 @@
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	if (on7gl_exec_wanted(imgp)) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(on7gl_exec_env), UIO_SYSSPACE, TRUE);
++		if (error) {
++			goto bad;
++		}
++		if (imgp->ip_argspace < new_ptr_size) {
++			error = E2BIG;
++			goto bad;
++		}
++		imgp->ip_argspace -= new_ptr_size;
++		imgp->ip_envc++;
++		printf("ON7 GL: backboardd started with %s\n", on7gl_exec_env);
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -38,6 +38,7 @@
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
+@@ -323,6 +324,102 @@
+ 	}
+ }
+ 
++/*
++ * 0196 (boot-arg on7gl=1): dyld asks AMFI what it may do for the process it starts
++ * (__mac_syscall("AMFI", 0x5a, { flags in, pointer to flags out })). There is no policy of that
++ * name here, the answer is ENOPOLICY and dyld treats every process as restricted: no DYLD_*
++ * variables, no @ paths (gl_test on xnu91: "security policy does not allow @ path expansion").
++ * With on7gl=1 a policy "AMFI" answers "allow all" (0xff, as the Galaxy A50 port's miniamfi) to
++ * backboardd only, so that the DYLD_INSERT_LIBRARIES kern_exec.c gives it (on7gl_exec_env) loads
++ * /usr/local/bin/libon7gl.dylib: EAGLContext on Mesa/panfrost, CoreAnimation's OpenGL ES road.
++ * Every other process and every other request: ENOPOLICY, what they got before.
++ */
++static TUNABLE(uint32_t, on7gl, "on7gl", 0);
++#define ON7GL_AMFI_CHECK_DYLD_POLICY    0x5a
++#define ON7GL_AMFI_DYLD_ALLOW_ALL       0xffULL
++static int on7gl_amfi_answered;
++
++static int
++on7gl_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t input_flags;
++		user_addr_t output_flags;
++	} args;
++	uint64_t flags = ON7GL_AMFI_DYLD_ALLOW_ALL;
++	char name[32];
++	int error;
++
++	if (call != ON7GL_AMFI_CHECK_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (strcmp(name, "backboardd") != 0) {
++		return ENOPOLICY;
++	}
++	error = copyin(arg, &args, sizeof(args));
++	if (error == 0) {
++		error = copyout(&flags, args.output_flags, sizeof(flags));
++	}
++	if (on7gl_amfi_answered < 4) {
++		on7gl_amfi_answered++;
++		printf("ON7 GL: dyld policy for %s[%d]: allow all (in 0x%llx) -> %d\n", name, proc_pid(p),
++		    args.input_flags, error);
++	}
++	return error;
++}
++
++static const struct mac_policy_ops on7gl_amfi_mac_ops = {
++	.mpo_policy_syscall = on7gl_amfi_syscall,
++};
++
++static struct mac_policy_conf on7gl_amfi_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = PORT_NAME " dyld policy for backboardd (on7gl)",
++	.mpc_ops = &on7gl_amfi_mac_ops,
++};
++
++static mac_policy_handle_t on7gl_amfi_mac_handle;
++
++/*
++ * kern.on7gl_log (on7gl=1 only): a line from libon7gl.dylib inside backboardd, which may not run
++ * as root (kern.on7xelte_wifi "log" is root only), into the kernel log as "ON7 GL> TEXT".
++ */
++static int
++on7gl_log_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char buf[200];
++	size_t n;
++	int err;
++
++	if (!on7gl) {
++		return ENOENT;
++	}
++	if (req->newptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, "", 1);
++	}
++	if (req->newlen == 0 || req->newlen >= sizeof(buf)) {
++		return EINVAL;
++	}
++	n = req->newlen;
++	err = SYSCTL_IN(req, buf, n);
++	if (err) {
++		return err;
++	}
++	buf[n] = 0;
++	for (char *c = buf; *c; c++) {
++		if (*c < 0x20 || *c >= 0x7f) {
++			*c = '?';
++		}
++	}
++	printf("ON7 GL> %s\\n", buf);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, on7gl_log, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    on7gl_log_sysctl, "A", "on7gl: a line of libon7gl.dylib into the kernel log");
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
+ };
+@@ -397,5 +494,10 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf(PORT_NAME " Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	if (on7gl) {
++		error = mac_policy_register(&on7gl_amfi_mac_conf, &on7gl_amfi_mac_handle, NULL);
++		printf("ON7 GL: AMFI dyld policy (backboardd only) %s (%d)\n",
++		    error ? "NOT registered" : "registered", error);
++	}
+ }
+ #endif /* SWEET || A5XELTE */

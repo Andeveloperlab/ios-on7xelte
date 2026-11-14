@@ -10,6 +10,7 @@ on:
     paths:
       - tools/mesa/**
       - tools/gl_test/**
+      - tools/eagl/**
       - .github/workflows/mesa.yml
   workflow_dispatch:
     inputs:
@@ -51,6 +52,17 @@ jobs:
           # xnu91 boot): the library by its path on the phone, beside gl_test (on7put makes no directories)
           install_name_tool -change @rpath/libOSMesa.8.dylib /usr/local/bin/libOSMesa.8.dylib out/bin/gl_test
           $CC -O2 -Wall -Werror -framework IOKit -o out/bin/mali_test tools/mali_test/mali_test.c
+          # libon7gl.dylib (tools/eagl): EAGLContext on Mesa inside backboardd (xnu 0196, boot-arg on7gl=1)
+          M=$RUNNER_TEMP/mesa/mesa-25.0.7
+          nm -gU out/lib/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > $RUNNER_TEMP/exported-gl.txt
+          wc -l $RUNNER_TEMP/exported-gl.txt
+          python3 tools/eagl/mkeagl.py tools/eagl/eagl_slots.txt $M/src/mapi/glapi/registry/gl.xml \
+            $RUNNER_TEMP/exported-gl.txt tools/eagl/eagl.c > $RUNNER_TEMP/eagl_gen.h
+          $CC -O2 -dynamiclib -install_name /usr/local/bin/libon7gl.dylib -I$RUNNER_TEMP -Itools/eagl \
+            -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc out/lib/libOSMesa.8.dylib \
+            -o out/bin/libon7gl.dylib tools/eagl/eagl.c tools/eagl/gl_osmesa.c tools/eagl/surface_checksum.c
+          install_name_tool -change @rpath/libOSMesa.8.dylib /usr/local/bin/libOSMesa.8.dylib out/bin/libon7gl.dylib
+          otool -L out/bin/libon7gl.dylib
           for f in out/bin/*; do codesign -f -s - --entitlements tools/on7wifid/on7wifid-ents.plist $f; done
           otool -L out/bin/gl_test
           ls -l out/bin out/lib
