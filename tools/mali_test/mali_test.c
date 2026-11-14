@@ -82,6 +82,53 @@ us_since(uint64_t then)
 	return (double)(mach_absolute_time() - then) * tb.numer / tb.denom / 1e3;
 }
 
+/* one WRITE_VALUE job of TYPE at the start of the buffer, target +0x800 (pre-filled with FILL); its status */
+static uint32_t
+typed_job(mach_vm_address_t base, const struct create_bo *bo, uint32_t type, uint64_t imm, uint32_t fill)
+{
+	volatile uint32_t *job = (volatile uint32_t *)base, *word = (volatile uint32_t *)(base + 0x800);
+	struct submit s = { .jc = bo->offset, .bo_handles = (uint64_t)(uintptr_t)&bo->handle, .bo_handle_count = 1 };
+	struct wait_bo wb = { .handle = bo->handle, .timeout_ns = 1000000000 };
+	struct wait_seq w;
+	kern_return_t kr;
+
+	memset((void *)base, 0, 0x1000);        /* a fresh descriptor every time: a DONE one fails (0x58, xnu87) */
+	word[0] = fill;
+	word[1] = fill;
+	job[4] = (2u << 1) | 1u | (1u << 16);   /* write value; 64-bit descriptor; job index 1 */
+	job[8] = (uint32_t)(bo->offset + 0x800);
+	job[9] = (uint32_t)((bo->offset + 0x800) >> 32);
+	job[10] = type;
+	job[12] = (uint32_t)imm;
+	job[13] = (uint32_t)(imm >> 32);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	if ((kr = request(kSubmit, &s, sizeof(s))) != KERN_SUCCESS || s.jc == 0) {
+		return 0xdead0000u | (kr & 0xffff);
+	}
+	w = (struct wait_seq){ .seq = s.jc, .timeout_ns = 1000000000 };
+	(void)request(kWaitSeq, &w, sizeof(w));
+	(void)request(kWaitBO, &wb, sizeof(wb));
+	return job[0];
+}
+
+/* which WRITE_VALUE types this GPU carries out from a user buffer (xnu89: type 6 DONE but nothing written) */
+static void
+type_matrix(mach_vm_address_t base, const struct create_bo *bo)
+{
+	static const struct { uint32_t type; const char *name; } types[] = {
+		{ 1, "cycles" }, { 2, "timestamp" }, { 3, "zero" }, { 4, "imm8" }, { 5, "imm16" }, { 6, "imm32" },
+		{ 7, "imm64" },
+	};
+	volatile uint32_t *word = (volatile uint32_t *)(base + 0x800);
+
+	for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+		uint32_t st = typed_job(base, bo, types[i].type, 0x1122334455667788ull, 0xa5a5a5a5u);
+
+		say("4t: type %u %-9s status %#x, words %08x %08x (fill a5a5a5a5)", types[i].type, types[i].name, st,
+		    word[0], word[1]);
+	}
+}
+
 /* one WRITE_VALUE job at the start of the buffer, writing VALUE to +0x800; 1 if the GPU wrote it */
 static int
 one_job(mach_vm_address_t base, const struct create_bo *bo, uint32_t value, int verbose)
@@ -170,6 +217,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	type_matrix(base, &bo);
 	if (one_job(base, &bo, 0xc0ffee01u, 1)) {
 		uint64_t started = mach_absolute_time();
 

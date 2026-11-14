@@ -1,0 +1,39 @@
+name: userland
+
+# Build the on7xelte test programs (iOS arm64, ad-hoc signed) without touching
+# a root image: for the kernel's file installer (xnu 0194, on7put), which puts
+# them into the phone's root at boot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: GitHub runner label (macos-15-intel when arm64 runners are out of capacity)
+        default: macos-15
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build mali_test
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="$(xcrun --sdk iphoneos --find clang) -isysroot $SDK -arch arm64 -miphoneos-version-min=16.0"
+          mkdir -p out
+          $CC -O2 -Wall -Werror -framework IOKit -o out/mali_test tools/mali_test/mali_test.c
+          codesign -f -s - --entitlements tools/on7wifid/on7wifid-ents.plist out/mali_test
+          file out/mali_test
+          shasum -a 256 out/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland
+          path: out
+          retention-days: 14
