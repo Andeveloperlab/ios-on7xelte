@@ -1,0 +1,137 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -451,6 +451,126 @@
+ 	publish(to);
+ 	return kIOReturnSuccess;
+ }
++
++/*
++ * 0189: first look at the Mali-T830 (GPU step 1). Boot-arg on7mali:
++ *   0 (default) nothing.
++ *   1 read only: the G3D power domain's PMU state, which is always on, and,
++ *     only when the domain is already on, CMU_G3D and the GPU's ID registers.
++ *   2 also power the domain on the way Samsung's pwrcal does (S5E7870-pmu.c
++ *     g3d_prev(1), g3d_config, blkpwr_enable), open the G3D bus/APB clock
++ *     gates and read the GPU's ID registers.
++ * Runs 20 s after AppleCLCD starts, on its own thread, so the USB log is up.
++ * A read of the GPU or CMU_G3D with the domain off is a bus hang (also seen on
++ * the Exynos 9810 by the a50 port), hence the status check before each.
++ * Addresses: kernel_Tush1211 drivers/soc/samsung/pwrcal/S5E7870/
++ * (S5E7870-sfrbase.h, -pmusfr.h, -cmusfr.h) and exynos7870.dtsi mali@11400000.
++ */
++#define ON7_PMU_PA              0x10480000ULL   /* PMU_ALIVE */
++#define ON7_PMU_G3D_SYS_PWR(o)  (0x1400 + (o))  /* CLKRUN 0x40 CLKSTOP 0x80 PLL 0xC0 LOGIC 0x100 CMU 0x180 */
++#define ON7_PMU_G3D_CONF        0x4000
++#define ON7_PMU_G3D_STATUS      0x4004
++#define ON7_PMU_G3D_OPTION      0x4008
++#define ON7_PMU_G3D_DURATION0   0x4010
++#define ON7_CMU_MIF_PA          0x10460000ULL
++#define ON7_CMU_G3D_PA          0x11460000ULL
++#define ON7_MALI_PA             0x11400000ULL
++
++static uint32_t
++on7_rd(volatile uint32_t *b, uint32_t off)
++{
++	return b[off / 4];
++}
++
++static void
++on7_mali_regs(volatile uint32_t *cmu, volatile uint32_t *gpu)
++{
++	IOLog("ON7 MALI: CMU_G3D pll_con0 %08x mux_pll %08x mux_switch_user %08x mux_g3d %08x div_bus %08x div_apb %08x en_bus %08x en_apb %08x\n",
++	    on7_rd(cmu, 0x100), on7_rd(cmu, 0x200), on7_rd(cmu, 0x204), on7_rd(cmu, 0x208),
++	    on7_rd(cmu, 0x400), on7_rd(cmu, 0x404), on7_rd(cmu, 0x804), on7_rd(cmu, 0x808));
++	IOLog("ON7 MALI: reading GPU_ID\n");
++	IODelay(1000);
++	IOLog("ON7 MALI: GPU_ID %08x L2_FEATURES %08x MEM_FEATURES %08x MMU_FEATURES %08x AS_PRESENT %08x JS_PRESENT %08x GPU_STATUS %08x\n",
++	    on7_rd(gpu, 0x000), on7_rd(gpu, 0x004), on7_rd(gpu, 0x010), on7_rd(gpu, 0x014),
++	    on7_rd(gpu, 0x018), on7_rd(gpu, 0x01c), on7_rd(gpu, 0x034));
++	IOLog("ON7 MALI: SHADER_PRESENT %08x TILER_PRESENT %08x L2_PRESENT %08x SHADER_READY %08x L2_READY %08x THREAD_MAX %08x\n",
++	    on7_rd(gpu, 0x100), on7_rd(gpu, 0x110), on7_rd(gpu, 0x120), on7_rd(gpu, 0x140),
++	    on7_rd(gpu, 0x160), on7_rd(gpu, 0x0a0));
++}
++
++static void
++on7_mali_probe(void *arg, wait_result_t wr)
++{
++	int mode = (int)(uintptr_t)arg;
++	(void)wr;
++
++	IOSleep(20000);
++	volatile uint32_t *pmu = (volatile uint32_t *)ml_io_map(ON7_PMU_PA, 0x5000);
++	volatile uint32_t *mif = (volatile uint32_t *)ml_io_map(ON7_CMU_MIF_PA, 0x1000);
++	if (pmu == NULL || mif == NULL) {
++		IOLog("ON7 MALI: no mapping\n");
++		return;
++	}
++	uint32_t st = on7_rd(pmu, ON7_PMU_G3D_STATUS);
++	IOLog("ON7 MALI: mode %d PMU G3D conf %08x status %08x option %08x dur0 %08x sys_pwr clkrun %08x clkstop %08x pll %08x logic %08x cmu %08x; CMU_MIF g3d_switch div %08x en %08x\n",
++	    mode, on7_rd(pmu, ON7_PMU_G3D_CONF), st, on7_rd(pmu, ON7_PMU_G3D_OPTION),
++	    on7_rd(pmu, ON7_PMU_G3D_DURATION0),
++	    on7_rd(pmu, ON7_PMU_G3D_SYS_PWR(0x40)), on7_rd(pmu, ON7_PMU_G3D_SYS_PWR(0x80)),
++	    on7_rd(pmu, ON7_PMU_G3D_SYS_PWR(0xc0)), on7_rd(pmu, ON7_PMU_G3D_SYS_PWR(0x100)),
++	    on7_rd(pmu, ON7_PMU_G3D_SYS_PWR(0x180)), on7_rd(mif, 0x460), on7_rd(mif, 0x860));
++	if ((st & 0xf) != 0xf) {
++		if (mode < 2) {
++			IOLog("ON7 MALI: G3D domain is off; on7mali=2 powers it on\n");
++			return;
++		}
++		/* g3d_prev(1): SYS_PWR_REG bit 0 = 0 for CLKRUN, CLKSTOP, DISABLE_PLL, RESET_LOGIC, RESET_CMU */
++		static const uint32_t sp[] = { 0x40, 0x80, 0xc0, 0x100, 0x180 };
++		for (unsigned i = 0; i < sizeof(sp) / sizeof(sp[0]); i++) {
++			pmu[ON7_PMU_G3D_SYS_PWR(sp[i]) / 4] &= ~1u;
++		}
++		/* g3d_config: OPTION bit 0 = 1, DURATION0 [11:4] = 0 */
++		pmu[ON7_PMU_G3D_OPTION / 4] |= 1u;
++		pmu[ON7_PMU_G3D_DURATION0 / 4] &= ~(0xffu << 4);
++		/* blkpwr_enable: CONFIGURATION [3:0] = 0xF, wait for STATUS [3:0] = 0xF */
++		pmu[ON7_PMU_G3D_CONF / 4] |= 0xfu;
++		uint32_t n = 0;
++		while (((st = on7_rd(pmu, ON7_PMU_G3D_STATUS)) & 0xf) != 0xf && n < 10000) {
++			IODelay(10);
++			n++;
++		}
++		IOLog("ON7 MALI: power on -> status %08x after %u polls\n", st, n);
++		if ((st & 0xf) != 0xf) {
++			return;
++		}
++	}
++	volatile uint32_t *cmu = (volatile uint32_t *)ml_io_map(ON7_CMU_G3D_PA, 0x2000);
++	volatile uint32_t *gpu = (volatile uint32_t *)ml_io_map(ON7_MALI_PA, 0x5000);
++	if (cmu == NULL || gpu == NULL) {
++		IOLog("ON7 MALI: no CMU/GPU mapping\n");
++		return;
++	}
++	if (mode >= 2) {
++		/* the gates g3d_prev(0) opens before power-off: BUS [1:0], APB [0] */
++		cmu[0x804 / 4] |= 0x3u;
++		cmu[0x808 / 4] |= 0x1u;
++	}
++	on7_mali_regs(cmu, gpu);
++}
++
++static void
++on7_mali_start(void)
++{
++	int mode = 0;
++	thread_t th;
++
++	(void)PE_parse_boot_argn("on7mali", &mode, sizeof(mode));
++	if (mode <= 0) {
++		return;
++	}
++	if (kernel_thread_start(&on7_mali_probe, (void *)(uintptr_t)mode, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
+ #endif /* A5XELTE */
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -586,6 +706,7 @@
+ 			OSSafeReleaseNULL(bl);
+ 		}
+ 	}
++	on7_mali_start();       /* 0189 */
+ #endif
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
