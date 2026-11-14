@@ -1,0 +1,158 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -621,6 +621,94 @@
+ 
+ static IOBufferMemoryDescriptor *on7_gpu_mem;
+ 
++/*
++ * 0192: Mali interrupts. This port has no SPI dispatcher (USB, Wi-Fi and the
++ * a50 port's Mali all poll), so sleh_irq (osfmk/arm64/sleh.c, A5XELTE) calls
++ * on7_mali_irq() for INTID 313-315 (exynos7870.dtsi mali: SPI 282 JOB,
++ * 283 MMU, 281 GPU; INTID = SPI + 32). The GIC-400 distributor
++ * (GICD 0x104e1000) gets priority 0xa0, target CPU interface 0 and enable for
++ * the three lines; the group bit is only logged (secure-only to write).
++ * In IRQ context: read the block's IRQ_STATUS, clear it, count it,
++ * thread_wakeup on the counter. No logging there.
++ */
++extern "C" wait_result_t assert_wait_timeout(event_t event, wait_interrupt_t interruptible,
++    uint32_t interval, uint32_t scale_factor);
++extern "C" wait_result_t thread_block(thread_continue_t continuation);
++extern "C" kern_return_t thread_wakeup_prim(event_t event, boolean_t one_thread, wait_result_t result);
++
++#define ON7_GICD_PA             0x104e1000ULL
++#define ON7_MALI_INTID_GPU      313
++
++static volatile uint32_t *on7_gpu_regs;
++static volatile uint32_t *on7_gicd;
++static volatile uint32_t on7_mali_irq_n[3];     /* GPU, JOB, MMU */
++static volatile uint32_t on7_mali_irq_st[3];    /* OR of every status seen */
++static volatile uint32_t on7_mali_irq_spurious;
++
++extern "C" int
++on7_mali_irq(uint32_t intid)
++{
++	volatile uint32_t *gpu = on7_gpu_regs;
++	if (gpu == NULL) {
++		return 0;
++	}
++	unsigned k = intid - ON7_MALI_INTID_GPU;        /* 0 GPU, 1 JOB, 2 MMU */
++	uint32_t b = k * 0x1000;
++	uint32_t st = gpu[(b + (k == 0 ? 0x2c : 0x0c)) / 4];
++	if (st == 0) {
++		on7_mali_irq_spurious++;
++		return 1;
++	}
++	gpu[(b + (k == 0 ? 0x24 : 0x04)) / 4] = st;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	on7_mali_irq_st[k] |= st;
++	on7_mali_irq_n[k]++;
++	thread_wakeup_prim((event_t)&on7_mali_irq_n[k], FALSE, THREAD_AWAKENED);
++	return 1;
++}
++
++static void
++on7_mali_gic_log(const char *when)
++{
++	volatile uint32_t *d = on7_gicd;
++	uint32_t w = ON7_MALI_INTID_GPU / 32;   /* word 9: INTIDs 288-319, ours bits 25-27 */
++	IOLog("ON7 MALI: GIC %s: ctlr %08x group %08x enable %08x pending %08x active %08x prio %08x target %08x cfg %08x\n",
++	    when, d[0], d[(0x080 + 4 * w) / 4], d[(0x100 + 4 * w) / 4], d[(0x200 + 4 * w) / 4],
++	    d[(0x300 + 4 * w) / 4], d[(0x400 + 312) / 4], d[(0x800 + 312) / 4], d[(0xc00 + 4 * 19) / 4]);
++}
++
++static void
++on7_mali_irq_setup(volatile uint32_t *gpu)
++{
++	on7_gicd = (volatile uint32_t *)ml_io_map(ON7_GICD_PA, 0x1000);
++	if (on7_gicd == NULL) {
++		IOLog("ON7 MALI: no GICD mapping\n");
++		return;
++	}
++	volatile uint8_t *gb = (volatile uint8_t *)on7_gicd;
++	on7_mali_gic_log("before");
++	on7_wr(gpu, MALI_GPU_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_JOB_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_MMU_IRQ_MASK, 0);
++	on7_wr(gpu, MALI_GPU_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_JOB_IRQ_CLEAR, 0xffffffffu);
++	on7_wr(gpu, MALI_MMU_IRQ_CLEAR, 0xffffffffu);
++	on7_gpu_regs = gpu;
++	for (uint32_t id = ON7_MALI_INTID_GPU; id < ON7_MALI_INTID_GPU + 3; id++) {
++		gb[0x400 + id] = 0xa0;
++		gb[0x800 + id] = 0x01;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	on7_gicd[(0x100 + 4 * (ON7_MALI_INTID_GPU / 32)) / 4] = 7u << (ON7_MALI_INTID_GPU % 32);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* GPU: fault, multiple faults, clean caches done; JOB: done + failed for 3 slots;
++	 * MMU: page fault + bus error for 8 address spaces */
++	on7_wr(gpu, MALI_GPU_IRQ_MASK, 1u | (1u << 7) | MALI_IRQ_CLEAN_DONE);
++	on7_wr(gpu, MALI_JOB_IRQ_MASK, 0x00070007u);
++	on7_wr(gpu, MALI_MMU_IRQ_MASK, 0x00ff00ffu);
++	on7_mali_gic_log("enabled");
++}
++
+ static void
+ on7_mali_job_test(volatile uint32_t *gpu, int step)
+ {
+@@ -729,6 +817,44 @@
+ 	    on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT), on7_rd(gpu, MALI_GPU_FAULTSTATUS));
+ 	on7_wr(gpu, MALI_JOB_IRQ_CLEAR, 0xffffffffu);
+ 	on7_wr(gpu, MALI_MMU_IRQ_CLEAR, 0xffffffffu);
++	if (step < 7) {
++		return;
++	}
++
++	on7_mali_say("7 GIC + Mali IRQs");
++	on7_mali_irq_setup(gpu);
++	job[0] = job[1] = job[2] = job[3] = 0;
++	job2[0] = job2[1] = job2[2] = job2[3] = 0;
++	target[0] = target[2] = 0xdeadbeefu;
++	target[1] = target[3] = 0x12345678u;
++	flush_dcache64((addr64_t)pa, ON7_GPU_PAGES * 4096, TRUE);
++	uint32_t c0 = on7_mali_irq_n[1];
++	uint64_t a0 = mach_absolute_time(), ns;
++	assert_wait_timeout((event_t)&on7_mali_irq_n[1], THREAD_UNINT, 100, 1000 * 1000);
++	js[MALI_JS_HEAD_NEXT_LO / 4] = (uint32_t)ON7_GPU_VA;
++	js[MALI_JS_HEAD_NEXT_HI / 4] = (uint32_t)(ON7_GPU_VA >> 32);
++	js[MALI_JS_AFFINITY_NEXT_LO / 4] = on7_rd(gpu, MALI_SHADER_PRESENT);
++	js[MALI_JS_AFFINITY_NEXT_HI / 4] = 0;
++	js[MALI_JS_CONFIG_NEXT / 4] = 0 | MALI_JS_CFG_START_FLUSH | MALI_JS_CFG_END_FLUSH | MALI_JS_CFG_PRI(8);
++	on7_wr(gpu, MALI_JS1 + MALI_JS_COMMAND_NEXT, MALI_JS_CMD_START);
++	wait_result_t w = thread_block(THREAD_CONTINUE_NULL);
++	absolutetime_to_nanoseconds(mach_absolute_time() - a0, &ns);
++	flush_dcache64((addr64_t)pa, ON7_GPU_PAGES * 4096, TRUE);
++	IOLog("ON7 MALI: irq job chain: wait %s after %llu us, JOB irqs %u (+%u) status seen %08x; exceptions %08x/%08x cycles %08x%08x timestamp %08x%08x; job_raw now %08x\n",
++	    w == THREAD_AWAKENED ? "woken" : "TIMED OUT", ns / 1000, on7_mali_irq_n[1], on7_mali_irq_n[1] - c0,
++	    on7_mali_irq_st[1], job[0], job2[0], target[1], target[0], target[3], target[2],
++	    on7_rd(gpu, MALI_JOB_IRQ_RAWSTAT));
++
++	c0 = on7_mali_irq_n[0];
++	a0 = mach_absolute_time();
++	assert_wait_timeout((event_t)&on7_mali_irq_n[0], THREAD_UNINT, 100, 1000 * 1000);
++	on7_wr(gpu, MALI_GPU_COMMAND, MALI_CMD_CLEAN_CACHES);
++	w = thread_block(THREAD_CONTINUE_NULL);
++	absolutetime_to_nanoseconds(mach_absolute_time() - a0, &ns);
++	IOLog("ON7 MALI: irq clean caches: wait %s after %llu us, GPU irqs %u (+%u) status seen %08x; MMU irqs %u; spurious %u; gpu_raw now %08x\n",
++	    w == THREAD_AWAKENED ? "woken" : "TIMED OUT", ns / 1000, on7_mali_irq_n[0], on7_mali_irq_n[0] - c0,
++	    on7_mali_irq_st[0], on7_mali_irq_n[2], on7_mali_irq_spurious, on7_rd(gpu, MALI_GPU_IRQ_RAWSTAT));
++	on7_mali_gic_log("after test");
+ }
+ 
+ static void
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1898,6 +1898,13 @@
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
++#if defined(A5XELTE)
++		/* on7xelte 0192: Mali-T830 SPI 281-283 = INTID 313 GPU, 314 JOB, 315 MMU */
++		extern int on7_mali_irq(uint32_t intid);
++		if (intid >= 313 && intid <= 315 && on7_mali_irq(intid)) {
++			/* handled */
++		} else
++#endif
+ 		if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,

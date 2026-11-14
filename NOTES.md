@@ -233,6 +233,48 @@ on7malistep=6`; boot 19:06, same usblog):**
   compute/fragment job from userland. Panfrost's T830 quirks
   (L2_MMU_CONFIG external read/write limits, SHADER/TILER_CONFIG) still to apply.
 
+**0192 RESULT (GPU step 4, Mali interrupts; xnu86 = 0187..0192,
+`scratchpad/build192.sh` as root, now also rebuilds `osfmk/arm64/sleh.c`;
+BOOT p10, extra `sweetfb_hz=60 on7mali=1 on7malistep=7`; boot 22:13, same usblog):**
+- [O] This port had no SPI dispatch at all: sleh_irq (A5XELTE) handles the
+  timer PPI and SGIs itself and hands everything else to
+  `cdp->interrupt_handler` (PassthruInterruptController child = Apple's AIC,
+  absent here). USB, Wi-Fi and the a50 Mali all poll.
+- 0192: sleh.c (A5XELTE) calls `on7_mali_irq(intid)` for INTID 313-315
+  (dtsi mali: SPI 281 GPU, 282 JOB, 283 MMU; INTID = SPI + 32) before the
+  generic handler. In SweetFramebuffer.cpp: `on7_mali_irq` reads the block's
+  IRQ_STATUS (GPU 0x2c, JOB 0x100c, MMU 0x200c), clears it, counts, ORs the
+  status, `thread_wakeup_prim` on the counter (no logging in IRQ context).
+  Step 7 maps GICD 0x104e1000, sets priority 0xa0 and target CPU-if 0 for the
+  three lines, ISENABLER word 9 bits 25-27; Mali masks GPU 0x20081 (fault,
+  multiple, clean done), JOB 0x00070007, MMU 0x00ff00ff. Then the job chain
+  of 0191 again, waited with `assert_wait_timeout` + `thread_block`, and a
+  CLEAN_CACHES waited the same way.
+- [O] GICD before: group 0, enable 0, prio 0x40, target 0x01, cfg 0x55555555
+  (level). After: enable 0x0e000000, prio a0. Group stays 0 and the IRQ still
+  arrives as IRQ [I: GICv2 without security extensions view from here, or
+  group 0 signalled as IRQ; not investigated].
+- [O] **job chain: woken by the JOB IRQ after 87 us** (submit to wake-up),
+  status 0x2 (slot 1 done), both jobs exception 1, cycles/timestamp written.
+  **CLEAN_CACHES: woken by the GPU IRQ after 81 us**, status 0x20000. No MMU
+  IRQ, no spurious IRQ, no pending/active left. Boot normal to >270 s, no panic.
+- [O] Local sleh.o differs from the CI kit's (kit has hot/cold split
+  `.cold.N` functions and a jump table: other codegen flags in the CI
+  build); the function set is the same and the kernel boots.
+- NEXT (GPU step 5, 0193): kernel user client for Mesa. The a50 port's
+  `core/drivers/gpu/hakios.mali.cpp` (HakiosMali, APSL, from hakios-mt6768
+  RedwoodMali) already speaks the Linux panfrost DRM interface as IOKit user
+  client selectors (params, BO create/mmap/offset, submit, wait, plus
+  0x7c-0x7f IOSurface helpers) on top of backend calls
+  `hakios_mali_ready/parameter/address/map/mapped/unmap/submit/enqueue/wait`.
+  Plan: port that file to on7 (rename where needed), implement the backend
+  from 0189-0192 (VA allocator, LPAE map/unmap with 4 KB GPU pages under the
+  kernel's 16 KB pages, AS0 flush via LOCK/FLUSH_PT, job queue thread waking on
+  the JOB IRQ), apply panfrost's T830 quirks, then run a userland smoke test
+  (param query + one WRITE_VALUE chain from user space) before Mesa.
+  [G] Note: HakiosMali is "written and built, not yet run on the phone" on
+  the a50 too, so this is its first hardware run.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
