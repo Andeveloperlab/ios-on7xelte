@@ -32,6 +32,76 @@
   no crash. Still REFUSED on purpose (no data / unknown): 8 RATE, 57 MCS, 96, 97,
   106, 115, 346, 365, 423, sets 25, 422; configd 387.
 
+### J7 GPU plan (2026-11-14, research only, nothing flashed)
+
+Tags: [O] observed in code/log/doc, [I] inferred, [G] guess / unmeasured.
+
+Where pixels come from today:
+- [O] CA picks a renderer at the render server: Metal, else OpenGL ES (EAGL), else
+  its CPU rasterizer CA::OGL::SW (QuartzCore symbols in the GUI PLAN notes below;
+  same order stated in `ios-a50-exynos9610/core/userland/src/eagl.c` header).
+- [O] Metal is skipped because our `IOAcceleratorES` has no `MetalPluginName`
+  (patch 0151; CAMetalContextCreate polls that class 300x100 ms). Boot log
+  `candidates/xnu14/usblog-20261114-154207-ts.txt:32` "IOAcceleratorES published
+  (no Metal plugin)". So the phone runs CA's CPU renderer into IOSurfaces.
+- [O] Panel = loader's DECON scan-out buffer, phys 0x67000000, 1080x1920, stride 4320
+  (0109, log line 35). AppleCLCD swaps only record the frame; the 16.67 ms vsync
+  timer copies the latest one every 60/`sweetfb_hz` ticks, **default 10 Hz**
+  (0056 `uint32_t hz = 10`; `candidates/pipeline.ps1` cmdline has no sweetfb_hz).
+  0184 adds the 1242x2208 -> 1080x1920 2x2 box scale per presented frame, scalar C,
+  inside that timer callout (vsync notifies wait behind it [I]).
+- [O] Source surfaces: IOBufferMemoryDescriptor, cached kernel VA; panel memory
+  mapped write-combine (0046 `sweet_surface_create_physical`). cpus=8, a5cpufreq=1482.
+- [O] CA swap rate while in use ~26/s (log: 1000 swaps in ~38 s at 16:13-16:15).
+- [G] Per-frame cost of scaled present is unmeasured (~2 Mpx out, ~11 MB read).
+
+Hardware facts (Samsung 3.18 tree `kernel_Tush1211`):
+- [O] GPU `mali@11400000` size 0x5000, IRQ SPI 282 JOB / 283 MMU / 281 GPU, power
+  domain pd_g3d (`arch/arm64/boot/dts/exynos7870.dtsi:1319`). Vendor kbase r7p0 in
+  `drivers/gpu/arm/t83x/` (GPL).
+- [O] DECON (`drivers/video/fbdev/exynos/decon_7870/regs-decon.h`): 7 windows,
+  VIDW_ADD0(win)=0x880+win*0x10 (buffer start), VIDW_WHOLE/OFFSET (stride/crop),
+  VIDOSD alpha; no scaler registers seen in decon.h [O], so DECON cannot do the
+  20/23 downscale [I]. M2M scalers exist: `scaler@12C00000/12C10000` (MSCL, behind
+  sysmmu_mscl) and a FIMG2D v5 driver (`drivers/media/platform/exynos/`).
+- [O] Mesa Panfrost: T760/T820/**T830**/T860/T880 = Midgard v5, **GLES 3.1** / GL 3.1,
+  no Vulkan (docs.mesa3d.org/drivers/panfrost.html). eagl.c says CA asks EAGL API 3,
+  so GLES 3.x is enough [I].
+- [O] Sibling port `ios-port/ios-a50-exynos9610/core` already has the whole GLES
+  route on a Bifrost Mali-G72: kernel `drivers/gpu/hakios.mali.c` (APSL 2.0, from
+  hakios-mt6768 redwood_mali.c; JM job chains, AS0 page tables, panfrost UAPI) +
+  `hakios.mali.cpp` (IOKit service), `tools/mali-drmshim/`, and
+  `userland/src/eagl.c` (EAGLContext replacement in backboardd forwarding to Mesa,
+  zero-copy IOSurface textures). Its docs say CA draws through it on starlte; Metal
+  there is a separate, unfinished project (`docs/metal-plan.md`).
+
+Options (cost / gain):
+1. **CPU path tuning** (days, low risk, BOOT flash only). Measure present time;
+   try sweetfb_hz=30/60; NEON + split the scale across 2-4 cores; copy only damaged
+   rows (swap record has layer rects); move present off the vsync callout. Gain:
+   panel refresh 10 Hz -> 30-60 Hz [G], smoother scrolling. CA itself still CPU.
+2. **Hardware scale/flip without GPU** (1-2 weeks, medium). MSCL or FIMG2D does the
+   1242x2208 -> 1080x1920 scale into a 2nd panel buffer, DECON VIDW_ADD0 flips
+   between buffers at vsync (no tearing, no CPU copy). Needs sysmmu (or bypass +
+   <4 GB phys [G]) and clock/power from the vendor driver. Gain: present cost ~0 CPU.
+3. **Fake Metal (software)**: needs a `_MTLDevice` bundle + AIR shader compiler
+   (a50 metal-plan: 53 classes, ~1200 methods). Months, and a CPU Metal would be
+   slower than CA's own SW renderer [I]. Not worth it.
+4. **Real Mali via Panfrost GLES** (months, high). Port hakios.mali.c from
+   Bifrost to Midgard v5 (different GPU_ID/quirks, MMU in LPAE "legacy" mode,
+   no ACPM: 7870 G3D power/clock from the 3.18 tree's platform code), build Mesa
+   panfrost (Midgard compiler) for iOS arm64, inject eagl.c into backboardd (a50
+   uses its own init; on our launchd root this needs a different injection path).
+   Gain: CA compositing, blur and scaling on the GPU. Metal apps still won't run.
+5. Real Metal on Mali: out of reach (same argument as a50 `docs/ru/metal.md` 9.4).
+
+Recommended order: 1 -> 2 -> (decide) 4. 1 and 2 also stay useful after 4.
+FIRST CONCRETE STEP (not done yet): patch 0187 = time AppleCLCD::present /
+presentScaled with mach_absolute_time, log avg/max us and presents/s every 1000
+swaps; boot it (BOOT p10 only) with sweetfb_hz=10, then 30, then 60 in the
+pipeline.ps1 cmdline and read the USB log + user's feel. That number decides
+whether NEON/multicore is enough or option 2 is needed next.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
