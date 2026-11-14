@@ -387,6 +387,24 @@ the user's OK because it writes two files into the iOS root on userdata):**
   -> skipped), `candidates/xnu90.kernel` sha256 109afac3...053b.
 - NEXT: flash xnu90 with the same extra boot-args; read `mt: 4t:` lines.
 
+**xnu90 RESULT (same extra boot-args, boot 23:36):**
+- [O] `ON7 PUT`: mali_test replaced (70240 bytes, read back ok),
+  launchd.plist "already the payload" (skipped). Boot normal.
+- [O] Type matrix from the user process (target pre-filled a5a5a5a5, words
+  at +0x800/+0x804 after the job, all statuses 0x1 DONE):
+  type 1 cycles -> 07778889 00000000; type 2 timestamp -> 2e7795bf 00000000;
+  type 3 zero -> 0 0; types 4/5/6/7 (imm8/16/32/64, immediate
+  0x1122334455667788 at +0x30) -> 0 0 (both words zeroed, even for imm8).
+- [I] The user-process GPU path works end to end (descriptor in a user
+  buffer, GPU writes visible through the user mapping). The T830 (r1p0)
+  WRITE_VALUE does only cycles/timestamp/zero; the immediate types act as a
+  64-bit zero. [G] Either not in this GPU or the immediate sits elsewhere;
+  nothing in Mesa's Midgard path needs it [unverified].
+- mali_test now checks the timestamp (type 2) over a filled target instead
+  of imm32 (not flashed yet; it goes along with the next payload).
+- NEXT (GPU step 7): Mesa panfrost (Midgard v5) built for iOS against the
+  a50's `tools/mali-drmshim` on HakiosMali, first a compute/clear test.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is

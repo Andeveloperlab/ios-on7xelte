@@ -9,9 +9,10 @@
  *      at boot it waits up to 90 s for it
  *   2  its parameters (GET_PARAM), as panfrost asks for them
  *   3  a buffer (CREATE_BO): handle, GPU address; mapped here (MMAP_BO + IOConnectMapMemory64, type = handle)
- *   4  a WRITE_VALUE job written into it (job type 2, 64-bit descriptor, value type 6 = 32-bit immediate at
- *      +0x30, target at +0x20), SUBMIT, wait by number (0x7d) and by buffer (WAIT_BO), the word checked;
- *      then ROUNDS more jobs (default 1000) for the round-trip time
+ *   4  WRITE_VALUE jobs written into it (job type 2, 64-bit descriptor, target at +0x20, value type at +0x28):
+ *      first each value type 1-7 once (4t lines), then the GPU timestamp (type 2) over a filled target,
+ *      SUBMIT, wait by number (0x7d) and by buffer (WAIT_BO), the target checked; then ROUNDS more jobs
+ *      (default 1000) for the round-trip time
  *   5  the buffer given back (GEM_CLOSE)
  *
  *   mali_test [ROUNDS]     (launchd job com.on7xelte.malitest runs it once at boot)
@@ -129,7 +130,11 @@ type_matrix(mach_vm_address_t base, const struct create_bo *bo)
 	}
 }
 
-/* one WRITE_VALUE job at the start of the buffer, writing VALUE to +0x800; 1 if the GPU wrote it */
+/*
+ * one WRITE_VALUE job at the start of the buffer: the GPU's timestamp (type 2) into +0x800, pre-filled with
+ * VALUE; 1 if the GPU wrote it. Not an immediate: on the T830 (xnu90 type matrix) types 1/2/3 write cycles,
+ * timestamp and zero, but the immediate types 4-7 write a 64-bit 0, whatever the descriptor holds.
+ */
 static int
 one_job(mach_vm_address_t base, const struct create_bo *bo, uint32_t value, int verbose)
 {
@@ -140,11 +145,12 @@ one_job(mach_vm_address_t base, const struct create_bo *bo, uint32_t value, int 
 	kern_return_t kr, kb;
 
 	memset((void *)base, 0, 0x1000);        /* a fresh descriptor every time: a DONE one fails (0x58, xnu87) */
+	word[0] = value;
+	word[1] = value;
 	job[4] = (2u << 1) | 1u | (1u << 16);   /* write value; 64-bit descriptor; job index 1 */
 	job[8] = (uint32_t)(bo->offset + 0x800);
 	job[9] = (uint32_t)((bo->offset + 0x800) >> 32);
-	job[10] = 6;                            /* a 32-bit immediate */
-	job[12] = value;
+	job[10] = 2;                            /* the system timestamp */
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	if ((kr = request(kSubmit, &s, sizeof(s))) != KERN_SUCCESS || s.jc == 0) {
@@ -154,11 +160,12 @@ one_job(mach_vm_address_t base, const struct create_bo *bo, uint32_t value, int 
 	w = (struct wait_seq){ .seq = s.jc, .timeout_ns = 1000000000 };
 	kr = request(kWaitSeq, &w, sizeof(w));
 	kb = request(kWaitBO, &wb, sizeof(wb));
-	if (verbose || *word != value) {
-		say("4: job %llu: wait %#x, WAIT_BO %#x, status word %#x, the word %#x%s", (unsigned long long)s.jc, kr, kb,
-		    job[0], *word, *word == value ? " -- THE GPU WROTE IT" : " -- not written");
+	int written = job[0] == 1 && (word[0] != value || word[1] != value);
+	if (verbose || !written) {
+		say("4: job %llu: wait %#x, WAIT_BO %#x, status %#x, timestamp %08x%08x%s", (unsigned long long)s.jc, kr, kb,
+		    job[0], word[1], word[0], written ? " -- THE GPU WROTE IT" : " -- not written");
 	}
-	return *word == value;
+	return written;
 }
 
 int
