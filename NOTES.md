@@ -149,6 +149,29 @@ extra `sweetfb_hz=60`; boot 18:32:15, same usblog):**
   backboardd: sample backboardd (sweetsmp-style) to see where the ~40 ms/frame
   goes before deciding on the Mali/Panfrost route (option 4).
 
+**0189 RESULT (GPU step 1, xnu82 = 0187 + 0188 + 0189, `scratchpad/build189.sh`
+as root; BOOT p10, extra `sweetfb_hz=60 on7mali=1`; boot 18:43, usblog
+`candidates/xnu14/usblog-20261114-154207-ts.txt`; patch commit 0f52b72):**
+- User asked to stop CPU work and start the GPU. 0189 = read-only Mali probe in
+  SweetFramebuffer.cpp, kernel thread 20 s after AppleCLCD start, boot-arg
+  `on7mali` (0 off, 1 read PMU/CMU and read GPU only if the G3D domain is on,
+  2 also power the domain on with the pwrcal sequence; 2 was NOT run).
+- [O] PMU G3D conf 0xf, **status 0x0003000f (domain ON)**, option 1; G3D
+  SYS_PWR regs all 0; CMU_MIF G3D_SWITCH div 1 en 1. The bootloader leaves the
+  GPU domain powered, so no PMU write is needed.
+- [O] CMU_G3D PLL_CON0 0xa1570d01 (enabled, M 0x157 P 13 S 1 = 343 MHz from
+  26 MHz [I]), muxes on PLL/user side, div_apb 3, en_bus 0x1ff, en_apb 0x7f.
+- [O] **GPU_ID 0x08300010 = Mali-T830 r0p1** [I: product 0x0830, minor 1].
+  L2_FEATURES 0x07100206, MEM_FEATURES 1, MMU_FEATURES 0x2821, AS_PRESENT 0xff,
+  JS_PRESENT 7, SHADER/TILER/L2_PRESENT 1/1/1, THREAD_MAX 0x100, GPU_STATUS 0,
+  SHADER_READY/L2_READY 0 (cores not powered yet). No hang, boot normal.
+- NEXT (GPU step 2, 0190): kernel-only: GPU soft reset (GPU_COMMAND 1, wait
+  RESET_COMPLETED in GPU_IRQ_RAWSTAT), L2 then shader/tiler PWRON, read READY,
+  hook IRQ SPI 281/282/283 and log them; then set up one MMU address space and
+  run a trivial job (hakios.mali.c mali=N steps adapted to Midgard v5) before
+  Mesa panfrost + eagl.c. G3D voltage (S2MPU05 BUCK2) can be read with the USB
+  `pmic` command if a hang shows up under load.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
