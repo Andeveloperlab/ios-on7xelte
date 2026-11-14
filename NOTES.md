@@ -142,6 +142,8 @@ extra `sweetfb_hz=60`; boot 18:32:15, same usblog):**
 - [O] No panic, no backboardd/SpringBoard crash; PosterBoard sig 5 at ~161 s as
   every boot. Not yet: user's visual check of the new build (tearing is possible:
   still one panel buffer, written while DECON scans).
+- User (xnu81, 2026-11-14 evening): "not much effect, but a bit smoother"; no
+  tearing reported. Fits the numbers: ~23 fps is now CA's own rendering limit.
 - NEXT options: (a) NEON/vtbl horizontal pass or DECON double buffer (option 2)
   only if tearing is visible; (b) the real limit is now CA's SW renderer in
   backboardd: sample backboardd (sweetsmp-style) to see where the ~40 ms/frame
