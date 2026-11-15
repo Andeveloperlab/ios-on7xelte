@@ -412,6 +412,7 @@ static int blit_targets = 1;
  */
 static int blit_boxes = 1;
 static uint64_t blit_pixels;            /* (the frame line) how much this frame copied */
+static unsigned target_boxed, target_open;      /* (the frame line) draws and clears into targets, scissor test on / off */
 /*
  * A frame that is handed to the display must have been drawn. The display's driver waits for
  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
@@ -1689,10 +1690,11 @@ frame_end(struct eagl *e, bool finished)
 	if (e->frames <= 40 || e->frames % 20 == 0) {
 		say("hakios-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place, %u shown by the host; %llu us (%llu handing on, %llu "
-		    "waiting, %llu copying out), %llu before it for the IOSurfaces; %llu KB blitted\n", e->frames, e->calls, e->draws, e->triangles,
+		    "waiting, %llu copying out), %llu before it for the IOSurfaces; %llu KB blitted; into targets %u boxed %u open\n", e->frames, e->calls, e->draws, e->triangles,
 		    e->clears, e->uploads, e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, presented,
-		    after - e->began, e->flushing, waited - before, after - waited, e->attaching, blit_pixels * 4 >> 10);
+		    after - e->began, e->flushing, waited - before, after - waited, e->attaching, blit_pixels * 4 >> 10, target_boxed, target_open);
 	}
+	target_boxed = target_open = 0;
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
 	}
@@ -1747,6 +1749,11 @@ drawing(struct eagl *e)
 	frame_begin(e);
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		image->drawn = image->painted = true;
+		if (glIsEnabled(GL_SCISSOR_TEST)) {
+			target_boxed++;
+		} else {
+			target_open++;
+		}
 		if (blit_boxes && !image->whole) {
 			GLint box[4] = { 0, 0, 0, 0 };
 
