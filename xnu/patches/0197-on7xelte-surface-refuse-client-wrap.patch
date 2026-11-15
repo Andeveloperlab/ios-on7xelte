@@ -1,0 +1,59 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -43,6 +43,8 @@
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+ 	kSweetSurfaceLookup             = 4,
++	kSweetSurfaceWrapClientImage    = 6,
++	kSweetSurfaceWrapClientMemory   = 7,
+ 	kSweetSurfaceLimits             = 13,
+ 	kSweetSurfaceLookupFromPort     = 34,
+ 	kSweetSurfaceCreatePort         = 35,
+@@ -676,6 +678,21 @@
+ 		IOLog("SWEET SURF: create: bad property dictionary (%u bytes)\n", len);
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * 0197: a surface around the caller's own memory (IOSurfaceAddress: CoreAnimation's OpenGL ES
++	 * renderer asks for one around a page-aligned image) is not made here: refused, the caller
++	 * keeps its image and uploads it another way. Made of new memory it would be an empty picture.
++	 */
++	if (props->getObject("IOSurfaceAddress") != NULL) {
++		static uint32_t refused;
++		if (refused++ < 4) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s create around its own memory (IOSurfaceAddress) refused\n", name);
++		}
++		props->release();
++		return kIOReturnUnsupported;
++	}
+ 
+ 	SweetSurface *s = sweet_surface_alloc();
+ 	if (s == NULL) {
+@@ -772,6 +789,25 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case kSweetSurfaceWrapClientImage:
++	case kSweetSurfaceWrapClientMemory: {
++		/*
++		 * 0197: surfaces around the client's own image/memory are refused. Accepted with a zeroed
++		 * reply (the default below) they became surfaces with base and state page 0: CoreAnimation's
++		 * OpenGL ES renderer (libon7gl, on7gl=1) then read their bulk attachments at state + 0x30
++		 * (IOSurfaceGetBulkAttachments from CA::Render::iosurface_get_edr_factor) and backboardd
++		 * died at address 0x30 (xnu95). Refused, CA draws those images another way (so did the
++		 * Galaxy A50 port before its methodWrapClientImage).
++		 */
++		static uint32_t refused;
++		if (refused++ < 4) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET SURF: %s sel %u (wrap client %s) refused\n", name, selector,
++			    selector == kSweetSurfaceWrapClientImage ? "image" : "memory");
++		}
++		return kIOReturnUnsupported;
++	}
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {

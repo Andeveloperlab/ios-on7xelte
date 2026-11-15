@@ -616,6 +616,39 @@ for the user's OK: it raises the GPU voltage and clock):**
   this root is 16.7; backboardd crash loop = black screen -> undo: flash without on7gl.
   (5) then 0x7e zero-copy IOSurface import in HakiosMali for real speed.
 
+**COREANIMATION DRAWS ON THE GPU (xnu96, 0196 + 0197, 2026-11-15 13:08; local build, NOT CI):**
+- xnu95 (0196 only, extra `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1 on7gl=1 glcopy=1`,
+  log `candidates/xnu14/usblog-20261115-033643-ts.txt`): [O] policy registered, backboardd got
+  DYLD_INSERT_LIBRARIES, dyld "allow all", `hakios-gl: 8 of 8 methods of EAGLContext are ours`,
+  context "OpenGL ES 3.1 Mesa 25.0.7; Mali-T830 (Panfrost)", IOSurface 2 attached as a copy,
+  first shaders compiled, then `CRASH backboardd sig 11 far 0x30` in a loop.
+- Symbolicate runs 43659505622/43660355742/43660720450/43661818405/43662563129: [O] pc =
+  `_platform_memmove` <- `IOSurfaceClientGetBulkAttachments` (reads [client+0x70] + 0x30; client+0x68
+  = our lock result, so +0x70 = result+0x08 = state page address = 0) <-
+  `CA::Render::iosurface_get_edr_factor` <- `CA::WindowServer::IOSurface::wrap_buffer` <-
+  `CA::OGL::GLESContext::retain_image` <- `Image::retain_iosurface`, which wraps an image's own
+  memory with `IOSurfaceWrapClientImage` (sel 6) or `IOSurfaceCreate` + `IOSurfaceAddress`. The log
+  shows `SWEET SURF: backboardd sel 6` just before the crash. Cause: SweetSurface's default case
+  answered unknown selectors "success, zeroed output", so sel 6 gave a client surface with base and
+  state 0. The CPU renderer never asked for it.
+- 0197 (`xnu/patches/0197-on7xelte-surface-refuse-client-wrap.patch`, SweetSurface.cpp): sel 6/7
+  and create with `IOSurfaceAddress` -> kIOReturnUnsupported (logged 4 times each). CA then uploads
+  those images with glTexImage (as the A50 did before its methodWrapClientImage).
+- xnu96 = local build (scratchpad `build200.sh` = build199 + SweetSurface.cpp; kern_exec.o from CI
+  kit of 43649190007), sha256 da27f0e7...; boot image xnu96g sha256 7d31f11e..., same extra args.
+  Log `usblog-20261115-130718-ts.txt`: [O] `SWEET SURF: backboardd sel 6 (wrap client image)
+  refused` x4, `create around its own memory (IOSurfaceAddress) refused` x1, NO backboardd crash
+  in 6 minutes, `hakios-gl: frame N: ... draws, ... triangles` (14 frames in the first 5 min;
+  150-980 ms each; most frames "1 picture copied out" = glReadPixels of 1242x2208 into the
+  IOSurface, frames with "textures refilled from IOSurfaces (11040 KB)" are the slowest).
+  PosterBoard sig 5 once: also on earlier boots (24x on 11-14), not new. Screen content NOT yet
+  checked by the user [G: should show the same UI as the CPU renderer].
+- The phone is LEFT on xnu96g (on7gl=1). Undo = flash xnu95n / any kernel without on7gl.
+- NEXT: (1) user checks the screen (UI drawn? touch?); (2) speed: the copies dominate -> 0x7e
+  zero-copy IOSurface import in HakiosMali (and drop glcopy), then wrap-client-image like the A50's
+  methodWrapClientImage (kernel maps the client memory) instead of the 0197 refusal; (3) CI build
+  of 0197 (not pushed yet when written).
+
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
 - xnu95 = local build199.sh (0196 sweet_amfi.c, CI kern_exec.o of run 43649190007, payload
