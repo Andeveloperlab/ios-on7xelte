@@ -641,13 +641,13 @@ for the user's OK: it raises the GPU voltage and clock):**
   in 6 minutes, `hakios-gl: frame N: ... draws, ... triangles` (14 frames in the first 5 min;
   150-980 ms each; most frames "1 picture copied out" = glReadPixels of 1242x2208 into the
   IOSurface, frames with "textures refilled from IOSurfaces (11040 KB)" are the slowest).
-  PosterBoard sig 5 once: also on earlier boots (24x on 11-14), not new. Screen content NOT yet
-  checked by the user [G: should show the same UI as the CPU renderer].
+  PosterBoard sig 5 once: also on earlier boots (24x on 11-14), not new.
+- [O] 2026-11-15: the user confirmed the UI is shown on the screen with xnu96g (GPU renderer).
 - The phone is LEFT on xnu96g (on7gl=1). Undo = flash xnu95n / any kernel without on7gl.
-- NEXT: (1) user checks the screen (UI drawn? touch?); (2) speed: the copies dominate -> 0x7e
+- NEXT: (1) speed: the copies dominate -> 0x7e
   zero-copy IOSurface import in HakiosMali (and drop glcopy), then wrap-client-image like the A50's
-  methodWrapClientImage (kernel maps the client memory) instead of the 0197 refusal; (3) CI build
-  of 0197 (not pushed yet when written).
+  methodWrapClientImage (kernel maps the client memory) instead of the 0197 refusal; (2) CI build
+  of 0197: xnu run 43703120159 (commit 03f733a), result not read.
 
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
