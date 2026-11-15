@@ -1,6 +1,21 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## >>> J7 PRIME (on7xelte) - active handoff 2026-11-14 <<<
+## >>> J7 PRIME (on7xelte) - PROJECT PAUSED 2026-11-15 (final state) <<<
+
+The user stopped the project here (2026-11-15 ~15:20). State to pick up from:
+- Phone: J7 Prime runs iOS 16 from userdata with kernel xnu100b (BOOT p10; local build
+  `build203.sh` = CI kit + 0186-0199 files), extra boot-args `sweetfb_hz=60 on7mali=1
+  on7malistep=8 on7put=1 on7gl=1`. Display @3x 1242x2208 scaled to the 1080x1920 panel.
+  Android userdata is gone (approved earlier); bootloaders, recovery (TWRP), modem, EFS/persist
+  and the partition backups are untouched.
+- Works (user-confirmed): GUI, touch, keyboard, Wi-Fi + Safari, CoreAnimation on the Mali-T830
+  through Mesa panfrost (libon7gl in backboardd), zero-copy IOSurfaces (0198).
+- Speed: GPU fill-bound at 1242x2208 (frames ~20-80 ms). `sweetfb_2x=1` (0199, @2x 828x1472)
+  measured ~2x faster and the user said it looked right, then asked to go back to @3x; it stays
+  an opt-in boot-arg. Other open ideas: `glenv=HMD=1` default, BO cache in hakios-drm/panfrost.
+- Details of every step below (newest GPU sections near "WHERE A GPU FRAME'S TIME GOES").
+
+## >>> J7 PRIME (on7xelte) - handoff 2026-11-14 <<<
 
 - Full handoff: `candidates/HANDOFF-2026-11-14.md` (outside the repo).
 - 0184 (commit 90572cd, CI run 43599651915): the display is presented as
