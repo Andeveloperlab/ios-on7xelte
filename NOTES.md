@@ -728,6 +728,10 @@ on7put=1 on7gl=1 glframes=1 sweetfb_2x=1`.
   waiting median 4-7 ms (was 6-30). Use `sweetfb_2x=1` in every flash from now on.
 - NEXT (speed): make @2x the a5xelte default in code (keep `sweetfb_2x=0` to go back); then
   `glenv=HMD=1` as default; then BO cache in hakios-drm/panfrost.
+- [O] 15:13 user asked to go back to the old display ("eskisine geri don", reason not given):
+  reflashed xnu100b = same xnu100 kernel WITHOUT sweetfb_2x (extra `sweetfb_hz=60 on7mali=1
+  on7malistep=8 on7put=1 on7gl=1`). Log: swaps are 1242x2208 again (bpr 5120), so @3x is back and
+  the 0199 code stays off without the boot-arg. Phone LEFT on xnu100b. @2x NOT made the default.
 
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
