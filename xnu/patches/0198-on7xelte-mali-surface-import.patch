@@ -1,0 +1,288 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1553,7 +1553,7 @@
+ 	return done;
+ }
+ 
+-/* ---- HakiosMali (a50 hakios.mali.cpp, trimmed: no IOSurface requests) ---- */
++/* ---- HakiosMali (a50 hakios.mali.cpp, trimmed: no requests 0x7c/0x7f; 0x7e since 0198) ---- */
+ 
+ enum {
+ 	kDrmGemClose            = 0x09,
+@@ -1565,8 +1565,19 @@
+ 	kPanfrostGetBOOffset    = 0x45,
+ 	kPanfrostMadvise        = 0x48,
+ 	kHakiosMaliWait         = 0x7d,
++	kHakiosMaliSurface      = 0x7e,         /* 0198, as the a50's: an IOSurface's memory as a buffer */
+ };
+ 
++/* kHakiosMaliSurface (tools/mesa/hakios-drm: struct hakios_drm_surface) */
++struct mali_surface {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kMaliDescribe: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                          /* how big it is, */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++#define kMaliDescribe           0xffffffffu
++
+ struct mali_wait {
+ 	uint64_t seq;
+ 	int64_t timeout_ns;
+@@ -1614,7 +1625,8 @@
+ #define MALI_BUFFER_MAX         (256ull << 20)
+ 
+ struct mali_buffer {
+-	IOBufferMemoryDescriptor *memory;
++	IOMemoryDescriptor *memory;             /* made here, or an IOSurface's pixels (`surface`) */
++	SweetSurface *surface;                  /* 0198: held while the buffer is there */
+ 	uint64_t address, size;
+ 	uint64_t last_seq;
+ };
+@@ -1622,6 +1634,35 @@
+ static IOLock *gMaliLock;
+ static uint32_t gMaliClients, gMaliBuffers, gMaliSubmits;
+ 
++/*
++ * 0198: IOSurfaces drawn by the Mali (request 0x7e; CoreAnimation's OpenGL ES renderer in
++ * backboardd, libon7gl.dylib without glcopy). Their memory is cached for the processor (the
++ * program's mapping and the kernel's), the GPU's is not coherent with those caches: before a job
++ * that names such a surface its lines are cleaned and invalidated (what the processor wrote reaches
++ * the memory, no line is left to be written over the GPU's pixels later), and the display, before it
++ * reads one, waits for the surface's last job and invalidates again (no line fetched in the meantime
++ * stands for the GPU's pixels). The last job of each surface: on7_mali_surface_seq, by ID.
++ */
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);
++
++#define ON7_MALI_SURFACES       64
++static struct {
++	uint32_t id;
++	uint64_t seq;
++} on7_mali_surface_seq[ON7_MALI_SURFACES];      /* gMaliLock */
++static uint32_t on7_mali_surface_waits, on7_mali_surface_late;
++
++/* (only surfaces of wired kernel buffers are made GPU buffers: on7_mali_surface_buffer) */
++static void
++on7_mali_surface_flush(SweetSurface *s)
++{
++	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++
++	if (buffer != NULL && buffer->getLength() != 0) {
++		FlushPoC_DcacheRegion((vm_offset_t)buffer->getBytesNoCopy(), (size_t)buffer->getLength());
++	}
++}
++
+ /* a wired, write-combined buffer entered into the GPU's addresses: what createBO gives programs */
+ static IOBufferMemoryDescriptor *
+ on7_mali_buffer(uint64_t size, uint32_t flags, uint64_t *address)
+@@ -1711,6 +1752,7 @@
+ 	struct mali_buffer *buffer(uint32_t handle);
+ 	void freeBuffer(struct mali_buffer *b);
+ 	IOReturn createBO(struct drm_panfrost_create_bo *request);
++	IOReturn surfaceBuffer(struct mali_surface *request);
+ 
+ public:
+ 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -1753,9 +1795,40 @@
+ 	}
+ 	hakios_mali_unmap(b->address, b->size);
+ 	b->memory->release();
++	OSSafeReleaseNULL(b->surface);
+ 	bzero(b, sizeof(*b));
+ }
+ 
++/*
++ * 0198: what the display asks before it reads a surface's pixels (AppleCLCD::present): if the Mali
++ * drew it, wait for the surface's last job (at most 100 ms) and drop the processor's lines of it.
++ */
++static void
++on7_mali_surface_drawn(SweetSurface *s)
++{
++	uint64_t seq = 0;
++	bool used = false;
++
++	if (gMaliLock == NULL || s == NULL) {
++		return;
++	}
++	IOLockLock(gMaliLock);
++	unsigned slot = s->id % ON7_MALI_SURFACES;
++	if (on7_mali_surface_seq[slot].id == s->id) {
++		seq = on7_mali_surface_seq[slot].seq;
++		used = true;
++	}
++	IOLockUnlock(gMaliLock);
++	if (!used) {
++		return;
++	}
++	if (seq != 0 && !hakios_mali_wait(seq, 100ull * NSEC_PER_MSEC) && on7_mali_surface_late++ < 8) {
++		IOLog("ON7 MALI: surface %u shown before its job %llu was done\n", s->id, seq);
++	}
++	on7_mali_surface_waits++;
++	on7_mali_surface_flush(s);
++}
++
+ IOReturn
+ HakiosMaliUserClient::createBO(struct drm_panfrost_create_bo *request)
+ {
+@@ -1788,6 +1861,101 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * 0198: the pixels of an IOSurface as a buffer (the a50's surfaceBuffer): what the window server
++ * draws into, and what is shown. The surface is held for as long as the buffer is there; a surface
++ * that is a buffer of this client's already is that buffer again. Asked only to describe
++ * (kMaliDescribe), no buffer is made. Only surfaces of wired kernel memory (SweetSurface create):
++ * not the panel's own surface (its memory is outside the kernel's map of RAM). gMaliLock is held.
++ */
++IOReturn
++HakiosMaliUserClient::surfaceBuffer(struct mali_surface *request)
++{
++	static uint32_t logged;
++	SweetSurface *s = sweet_surface_copy(request->surface);
++	IOBufferMemoryDescriptor *memory;
++	struct mali_buffer *b = NULL;
++	uint64_t size, address;
++	bool mapped = true;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	memory = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++	size = memory != NULL ? round_page_64(memory->getLength()) : 0;
++	if (memory == NULL || size == 0 || size > MALI_BUFFER_MAX || s->elementWidth != 1 || s->elementHeight != 1) {
++		if (logged++ < 16) {
++			IOLog("ON7 MALI: surface %u (%ux%u fmt 0x%x) cannot be a buffer\n", s->id, s->width, s->height,
++			    s->pixelFormat);
++		}
++		s->release();
++		return kIOReturnUnsupported;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kMaliDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++	for (uint32_t i = 0; i < MALI_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			request->handle = i + 1;
++			s->release();
++			return kIOReturnSuccess;
++		}
++	}
++	for (uint32_t n = 0; n < MALI_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % MALI_BUFFERS;
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL) {
++		s->release();
++		return kIOReturnNoResources;
++	}
++	address = hakios_mali_address(size, false);
++	for (uint64_t o = 0; o < memory->getLength() && mapped && address != 0; o += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(o, &length, kIOMemoryMapperNone);
++		mapped = phys != 0 && hakios_mali_map(address + o, phys);
++	}
++	if (address == 0 || !mapped) {
++		if (address != 0) {
++			hakios_mali_unmap(address, size);
++		}
++		IOLog("ON7 MALI: surface %u (%llu bytes) cannot be entered into the GPU's addresses (pt pool %u/%u)\n",
++		    s->id, size, on7_pool_used, on7_pool_pages);
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	hakios_mali_mapped();
++	on7_mali_surface_flush(s);
++	memory->retain();
++	b->memory = memory;
++	b->surface = s;                         /* the reference sweet_surface_copy gave */
++	b->address = address;
++	b->size = size;
++	b->last_seq = 0;
++	OSIncrementAtomic((SInt32 *)&gMaliBuffers);
++	if (logged++ < 16) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("ON7 MALI: %s: surface %u (%ux%u fmt 0x%x, %u bytes a row) is buffer %u at GPU 0x%llx\n", name,
++		    s->id, s->width, s->height, s->pixelFormat, s->bytesPerRow, request->handle, address);
++	}
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ HakiosMaliUserClient::clientClose(void)
+ {
+@@ -1845,6 +2013,7 @@
+ 		struct drm_panfrost_get_bo_offset offset;
+ 		struct drm_panfrost_madvise madvise;
+ 		struct mali_wait waitseq;
++		struct mali_surface surface;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct mali_buffer *b;
+@@ -1910,6 +2079,21 @@
+ 
+ 		fSubmits++;
+ 		gMaliSubmits++;
++		/* 0198: the processor's lines of the surfaces this job names, out before it runs */
++		for (uint32_t i = 0; r.submit.jc != 0 && i < r.submit.bo_handle_count && i < 4096; i += 64) {
++			uint32_t handles[64];
++			uint32_t n = r.submit.bo_handle_count - i < 64 ? r.submit.bo_handle_count - i : 64;
++
++			if (copyin((user_addr_t)(r.submit.bo_handles + i * sizeof(uint32_t)), handles, n * sizeof(uint32_t)) != 0) {
++				break;
++			}
++			for (uint32_t k = 0; k < n; k++) {
++				b = buffer(handles[k]);
++				if (b != NULL && b->surface != NULL) {
++					on7_mali_surface_flush(b->surface);
++				}
++			}
++		}
+ 		if (r.submit.jc != 0) {
+ 			seq = hakios_mali_enqueue(r.submit.jc, r.submit.requirements & PANFROST_JD_REQ_FS);
+ 		}
+@@ -1924,6 +2108,11 @@
+ 				b = buffer(handles[k]);
+ 				if (b != NULL) {
+ 					b->last_seq = seq;
++					if (b->surface != NULL) {
++						unsigned slot = b->surface->id % ON7_MALI_SURFACES;
++						on7_mali_surface_seq[slot].id = b->surface->id;
++						on7_mali_surface_seq[slot].seq = seq;
++					}
+ 				}
+ 			}
+ 		}
+@@ -1936,6 +2125,9 @@
+ 	case kPanfrostMadvise:
+ 		r.madvise.retained = 1;
+ 		break;
++	case kHakiosMaliSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
+ 	case kDrmGemClose:
+ 		b = buffer(r.close.handle);
+ 		if (b != NULL) {
+@@ -2703,6 +2895,7 @@
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
++		on7_mali_surface_drawn(s);             /* 0198: the Mali's pixels, done and not stale */
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {

@@ -647,7 +647,29 @@ for the user's OK: it raises the GPU voltage and clock):**
 - NEXT: (1) speed: the copies dominate -> 0x7e
   zero-copy IOSurface import in HakiosMali (and drop glcopy), then wrap-client-image like the A50's
   methodWrapClientImage (kernel maps the client memory) instead of the 0197 refusal; (2) CI build
-  of 0197: xnu run 43703120159 (commit 03f733a), result not read.
+  of 0197: xnu run 43703120159 (commit 03f733a): success (read 13:33).
+
+**ZERO-COPY IOSURFACES ON THE GPU (xnu97, 0198, 2026-11-15 13:29; local build, NOT CI):**
+- 0198 (`xnu/patches/0198-on7xelte-mali-surface-import.patch`, SweetFramebuffer.cpp): HakiosMali
+  request 0x7e (`struct mali_surface`, as the A50's): an IOSurface id -> a Mali buffer over the
+  surface's own pages (IOBufferMemoryDescriptor only; describe-only with handle 0xffffffff; one
+  buffer per surface, deduped). Before each submit the surface memory is cleaned+invalidated
+  (FlushPoC_DcacheRegion, the GPU is not coherent); the job's seq is noted per surface
+  (`on7_mali_surface_seq[64]`), and AppleCLCD::present waits for it (<=100 ms, logs a late job)
+  and flushes again before the panel copy (`on7_mali_surface_drawn`).
+- xnu97 = scratchpad `build201.sh` (build200 + 0198 SweetFramebuffer.cpp), boot image xnu97g sha256
+  0fd33447..., extra `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1 on7gl=1` (NO glcopy).
+- Log `usblog-20261115-130718-ts.txt` after `### sent: recovery` at 13:28:14: [O]
+  `ON7 MALI: backboardd: surface 2 (1242x2208 ...) is buffer 8 at GPU 0x6220000`, surface 3 ->
+  buffer 22; `-attachImage: ... a texture, copied into its memory by the GPU`; frames now
+  "0 pictures copied out, 1 drawn in place", copy-out 2-4 us (was ~140 ms); steady frames
+  60-65 ms (xnu96: 150-200 ms), big frames 420-500 ms (xnu96: 920 ms). No crash in 3 min, no
+  late-job or pt-pool message. Screen NOT yet checked by the user.
+- The phone is LEFT on xnu97g. Undo = flash xnu96g (glcopy) or a kernel without on7gl.
+- NEXT: (1) user checks screen/touch; (2) still ~15-20 ms "waiting" per frame and 17 ms+ per
+  draw call batch: profile Mesa/panfrost (job submit, shader compile cache); (3) wrap client
+  image (sel 6) like the A50's methodWrapClientImage instead of the 0197 refusal; (4) CI build
+  of 0198.
 
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
