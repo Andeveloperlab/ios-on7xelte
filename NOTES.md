@@ -14,6 +14,13 @@ The user stopped the project here (2026-11-15 ~15:20). State to pick up from:
   measured ~2x faster and the user said it looked right, then asked to go back to @3x; it stays
   an opt-in boot-arg. Other open ideas: `glenv=HMD=1` default, BO cache in hakios-drm/panfrost.
 - Details of every step below (newest GPU sections near "WHERE A GPU FRAME'S TIME GOES").
+- REPO MOVED (2026-11-15, user's request): home is now github.com/furkan-karapinar/ios-on7xelte
+  (branches main + on7xelte/fix-7870-addresses, default main). Local remote `ci` points there; gh's
+  active account is furkan-karapinar; candidates/pipeline.ps1, watch-ci.ps1 and xnu14/build.ps1 use
+  `-R furkan-karapinar/ios-on7xelte`. theson45/ios-on7xelte was left as it is (not deleted); old CI
+  run IDs in these notes belong to it. [O] Actions on the new repo fail at once: "account is locked
+  due to a billing issue" (runs 43713463758 etc.): GitHub billing for furkan-karapinar must be fixed
+  before CI kernel/mesa builds run there.
 
 ## >>> J7 PRIME (on7xelte) - handoff 2026-11-14 <<<
 
