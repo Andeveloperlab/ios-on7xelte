@@ -269,6 +269,8 @@ struct image {
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
+	bool whole;                     /* (blit_boxes) this frame drew into it without a scissor box: all of it is new */
+	GLint box[4];                   /* ... else the union of the boxes it drew in, x0 y0 x1 y1 (x1 = 0: none yet) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
 	unsigned unchanged;             /* ... and how many looks in a row found it the same (surface_changed()) */
@@ -402,6 +404,14 @@ static int share_surfaces = 1;          /* boot-arg glcopy=1: 0 */
  * Boot-arg glblit=0: the surface's memory, as before.
  */
 static int blit_targets = 1;
+/*
+ * Only what a frame drew into is copied into the surface: CoreAnimation draws a frame's changes
+ * inside a scissor box and leaves the rest of the picture as it was (its surfaces take turns, and
+ * it knows what each one lacks). The whole 1242 x 2208 copy (11 MB read, 11 MB written) took the
+ * Mali-T830 most of a frame's 25 ms (xnu97). Boot-arg glbox=0: the whole picture, as before.
+ */
+static int blit_boxes = 1;
+static uint64_t blit_pixels;            /* (the frame line) how much this frame copied */
 /*
  * A frame that is handed to the display must have been drawn. The display's driver waits for
  * the GPU itself before it puts a surface on the panel, on a thread of its own, and says so in
@@ -1149,8 +1159,21 @@ target_to_surface(struct eagl *e, struct image *image)
 		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e->writer);
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->mirror, 0);
-		glBlitFramebuffer(0, 0, image->width, image->height, 0, image->invert ? image->height : 0, image->width,
-		    image->invert ? 0 : image->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		GLint x0 = 0, y0 = 0, x1 = image->width, y1 = image->height;
+
+		if (blit_boxes && !image->whole && image->box[2] > 0) {
+			x0 = image->box[0] < 0 ? 0 : image->box[0];
+			y0 = image->box[1] < 0 ? 0 : image->box[1];
+			x1 = image->box[2] > image->width ? image->width : image->box[2];
+			y1 = image->box[3] > image->height ? image->height : image->box[3];
+		}
+		image->whole = false;
+		image->box[0] = image->box[1] = image->box[2] = image->box[3] = 0;
+		if (x1 > x0 && y1 > y0) {
+			blit_pixels += (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+			glBlitFramebuffer(x0, y0, x1, y1, x0, image->invert ? image->height - y0 : y0, x1,
+			    image->invert ? image->height - y1 : y1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		}
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)read);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)draw);
 		if (IOSurfaceLock(surface, 0, NULL) == 0) {
@@ -1563,6 +1586,7 @@ frame_end(struct eagl *e, bool finished)
 	unsigned copied = 0, in_place = 0, presented = 0;
 
 	clear_now(e);
+	blit_pixels = 0;
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
@@ -1665,9 +1689,9 @@ frame_end(struct eagl *e, bool finished)
 	if (e->frames <= 40 || e->frames % 20 == 0) {
 		say("hakios-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place, %u shown by the host; %llu us (%llu handing on, %llu "
-		    "waiting, %llu copying out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles,
+		    "waiting, %llu copying out), %llu before it for the IOSurfaces; %llu KB blitted\n", e->frames, e->calls, e->draws, e->triangles,
 		    e->clears, e->uploads, e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, presented,
-		    after - e->began, e->flushing, waited - before, after - waited, e->attaching);
+		    after - e->began, e->flushing, waited - before, after - waited, e->attaching, blit_pixels * 4 >> 10);
 	}
 	if (e->frames == 30 || e->frames % 200 == 0) {
 		summary(e);
@@ -1723,6 +1747,28 @@ drawing(struct eagl *e)
 	frame_begin(e);
 	if (e->framebuffer != 0 && e->colour != 0 && (image = image_of(e, e->colour)) != NULL && image->target) {
 		image->drawn = image->painted = true;
+		if (blit_boxes && !image->whole) {
+			GLint box[4] = { 0, 0, 0, 0 };
+
+			if (!glIsEnabled(GL_SCISSOR_TEST)) {
+				image->whole = true;
+			} else {
+				glGetIntegerv(GL_SCISSOR_BOX, box);
+				if (box[2] > 0 && box[3] > 0) {
+					if (image->box[2] == 0) {
+						image->box[0] = box[0];
+						image->box[1] = box[1];
+						image->box[2] = box[0] + box[2];
+						image->box[3] = box[1] + box[3];
+					} else {
+						image->box[0] = box[0] < image->box[0] ? box[0] : image->box[0];
+						image->box[1] = box[1] < image->box[1] ? box[1] : image->box[1];
+						image->box[2] = box[0] + box[2] > image->box[2] ? box[0] + box[2] : image->box[2];
+						image->box[3] = box[1] + box[3] > image->box[3] ? box[1] + box[3] : image->box[3];
+					}
+				}
+			}
+		}
 		if (frame_lines && image->width >= 1000 && image->height >= 2000) {
 			/* the display's picture (a surface of its size): where this frame first draws into it */
 			e->line.into_display++;
@@ -4781,6 +4827,7 @@ install(void)
 			image_bytes_most = image_bytes_most < (16ull << 20) ? 16ull << 20 : image_bytes_most;
 		}
 		blit_targets = strstr(arguments, "glblit=0") == NULL;
+		blit_boxes = strstr(arguments, "glbox=0") == NULL;
 		sync_frames = strstr(arguments, "glsync=0") == NULL;
 		pace_frames = strstr(arguments, "glpace=0") == NULL;
 		if (strstr(arguments, "glwait=0") != NULL || (strstr(arguments, "glwait=1") == NULL && display_waits())) {
