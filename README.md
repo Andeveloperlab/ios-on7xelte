@@ -21,6 +21,11 @@ CoreAnimation draws on the Mali-T830 GPU through Mesa's panfrost driver.
 | ![XNU kernel console on the J7 Prime](docs/images/01-first-xnu-boot.jpg) | ![Apple logo](docs/images/02-apple-logo.jpg) | ![Apple logo with progress bar](docs/images/03-apple-logo-progress.jpg) | ![launchd mounting the HFS+ root](docs/images/04-launchd-boot-log.jpg) | ![iOS 16 lock screen](docs/images/05-lock-screen.jpg) |
 | XNU on the Exynos 7870, 2026-11-08 | iOS boot on the panel | Progress bar | HFS+ root from eMMC, launchd boot tasks | iOS 16 lock screen, 2026-11-09 |
 
+| Home screen | Settings | Safari |
+| :---: | :---: | :---: |
+| ![SpringBoard home screen](docs/images/06-home-screen.jpg) | ![Settings app](docs/images/07-settings.jpg) | ![Safari over Wi-Fi](docs/images/08-safari.jpg) |
+| SpringBoard, charging, Wi-Fi connected | Settings app | Safari browsing over Wi-Fi |
+
 ## Device
 
 | | |
@@ -156,8 +161,9 @@ CoreAnimation, Mesa'nın panfrost sürücüsüyle Mali-T830 GPU üzerinde çizer
 ### Fotoğraflar
 
 Yukarıdaki fotoğraflar sırasıyla: Exynos 7870 üzerinde ilk XNU açılışı (2026-11-08), panelde
-Apple logosu, ilerleme çubuğu, eMMC'deki HFS+ kökten `launchd` açılış kaydı ve iOS 16 kilit ekranı
-(2026-11-09).
+Apple logosu, ilerleme çubuğu, eMMC'deki HFS+ kökten `launchd` açılış kaydı, iOS 16 kilit ekranı
+(2026-11-09); ardından SpringBoard ana ekranı (şarj oluyor, Wi-Fi bağlı), Ayarlar uygulaması ve
+Wi-Fi üzerinden gezinen Safari.
 
 ### Cihaz
 
