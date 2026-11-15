@@ -704,6 +704,12 @@ for the user's OK: it raises the GPU voltage and clock):**
   (2) render CA at the panel's 1080x1920 instead of 1242x2208 (-25% pixels) or lower (2x: 828x1472,
   -56%), which needs the display/scale setup changed; (3) BO cache in hakios-drm/panfrost (bo_alloc
   and bo_free still go to the kernel per batch).
+- [O] 14:40-15:00 user A/B by feel, no debug args: xnu98b (glblit=0) "quite slow" (mid frames median
+  54 ms); xnu99h (box code + HMD=1), xnu97h (old libon7gl + HMD=1) and xnu97g again (exactly the
+  first xnu97g setup) ALL "still slow / the same". Mid-frame medians of the first ~40 frames: 22 ms
+  (first xnu97g boot), 31, 27, 84 ms (second xnu97g boot): that number depends on what was on the
+  screen, not on the build. So: glblit=0 is worse (dropped); box code and HMD=1 did NOT slow it down;
+  the GPU renderer is simply this slow at 1242x2208. Phone LEFT on xnu97g (no HMD, no logs).
 
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
