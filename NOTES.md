@@ -672,6 +672,39 @@ for the user's OK: it raises the GPU voltage and clock):**
   image (sel 6) like the A50's methodWrapClientImage instead of the 0197 refusal; (4) CI build
   of 0198.
 
+**WHERE A GPU FRAME'S TIME GOES (2026-11-15 13:35-14:38, xnu97p/xnu98p/xnu98f/xnu98b/xnu99f; local builds):**
+- Tools: eagl boot-args `glprof=500` (sampling profile of the drawing thread, "hakios-prof:" lines),
+  `glslow=8000` ("tl: slow CALL US" lines), `glframes=1` (per-frame box line). Symbols: mesa.yml now
+  also uploads artifact `gpu-symbols` (unstripped libs, a7aa089; run 43704875882: its stripped
+  libOSMesa is byte-identical to run 43649189968's, sha256 37f2bad3..., the one on the phone [G: the
+  phone's copy is that run's]). Scratchpad scripts `prof.py LOG SYMS OUT` (symbolizes with WSL
+  llvm-symbolizer; NOT `--functions=short`, that gives ??) and `fstat.py LOG -1` (frame stats of the
+  last boot in the USB log).
+- [O] Frames are GPU-bound, not CPU-bound: an 8-draw frame takes 18-25 ms, of which ~15-20 ms is the
+  wait for the GPU (eagl's glFinish at the frame end, inside CA's glFlush: "tl: slow glFlush ~28 ms";
+  glFinishObjectAPPLE ~15 ms). Profile of the drawing thread's CPU: Mesa's BO life cycle through
+  hakios-drm ioctls (bo_alloc 6.7%, make_(un)evictable 5.5%, bo_free 3.2%, mmap 3.8%, submit ~4%,
+  bo_wait 2.6%), memmove for IOSurface texture refills 3%.
+- [O] `glenv=HMD=1` (hakios-drm answers MADVISE locally; HakiosMali never purges) removes the
+  make_(un)evictable ioctls from the profile; no visible problem. Not yet the default.
+- eagl b357b68 (blit only the frame's scissor box, `glbox=0` = whole) + e947c07 (frame line: "KB
+  blitted; into targets N boxed M open"): [O] blit stays 10712 KB (whole) on every frame:
+  CoreAnimation draws into its targets with the scissor test OFF in nearly every frame (e.g. 8-draw
+  frames "boxed 5 open 2", big ones "boxed 47 open 52"; glframes: first draw "box off" with a box
+  set). So the box gives nothing; kept (harmless, glbox=0 turns it off).
+- [O] `glblit=0` (draw into the surface's memory, no blit): small frames median 24 -> 19.7 ms,
+  waiting ~0; mid frames unchanged (noisy). Screen NOT checked by the user with glblit=0 (the
+  comment in eagl.c says it once gave frames with parts missing on another path).
+- [G] The rest is fill rate: 1242x2208 = 2.74 Mpixels; Mali-T830 MP1 at 1001 MHz ~1 pixel/clock,
+  unscissored passes preload + write the whole target; a few full-screen layers = 15-20 ms.
+- Kernels: xnu98 = build202.sh (build201 + payload p202 = libon7gl of mesa run 43705864385),
+  xnu99 = same with libon7gl of run 43708756407 (e947c07). Phone LEFT on xnu99f (extra
+  `sweetfb_hz=60 on7mali=1 on7malistep=8 on7put=1 on7gl=1 glframes=1 glslow=8000 glenv=HMD=1`).
+- NEXT (speed): (1) user checks glblit=0 visually; if clean, make it (and HMD=1) the default;
+  (2) render CA at the panel's 1080x1920 instead of 1242x2208 (-25% pixels) or lower (2x: 828x1472,
+  -56%), which needs the display/scale setup changed; (3) BO cache in hakios-drm/panfrost (bo_alloc
+  and bo_free still go to the kernel per batch).
+
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
 - xnu95 = local build199.sh (0196 sweet_amfi.c, CI kern_exec.o of run 43649190007, payload
