@@ -1,0 +1,50 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>     /* 0191 */
+ #include <IOKit/IOPlatformExpert.h>            /* 0193 */
++#include <IOKit/IODeviceTreeSupport.h>          /* 0199 */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -91,6 +92,13 @@
+  * to the 1080x1920 panel like a real 8 Plus does (2x2 box filter on the
+  * CPU). Touches stay panel-normalized (SweetHID.cpp), which is the same
+  * fraction of the scaled display.
++ *
++ * 0199: boot-arg sweetfb_2x=1 presents the same 414x736 points at @2x,
++ * 828x1472, and stretches that up to the panel (same row/column code: each
++ * panel pixel averages the two logical neighbours it lands on). The Mali
++ * fills 1242x2208 at about one pixel per clock, which made the GPU frames
++ * 20-30 ms; @2x has 56% fewer pixels. MobileGestalt reads the scale from
++ * IODeviceTree:/chosen/display-scale, set to 2 here before it runs.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #define SWEET_FB_LOGICAL_W              1242
+@@ -2355,6 +2363,25 @@
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
++#if defined(SWEET_FB_SCALE)
++	int twox = 0;
++	PE_parse_boot_argn("sweetfb_2x", &twox, sizeof(twox));
++	if (!native && twox) {
++		fLogicalW = SWEET_FB_LOGICAL_W * 2 / 3;
++		fLogicalH = SWEET_FB_LOGICAL_H * 2 / 3;
++		IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++		if (chosen != NULL) {
++			uint32_t two = 2;
++			OSData *d = OSData::withBytes(&two, sizeof(two));
++			if (d != NULL) {
++				chosen->setProperty("display-scale", d);
++				d->release();
++			}
++			chosen->release();
++		}
++		IOLog("SWEET FB: @2x, %ux%u stretched to the panel\n", fLogicalW, fLogicalH);
++	}
++#endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ #if defined(SWEET_FB_SCALE)

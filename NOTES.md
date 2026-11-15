@@ -711,6 +711,19 @@ for the user's OK: it raises the GPU voltage and clock):**
   screen, not on the build. So: glblit=0 is worse (dropped); box code and HMD=1 did NOT slow it down;
   the GPU renderer is simply this slow at 1242x2208. Phone LEFT on xnu97g (no HMD, no logs).
 
+**@2x DISPLAY (0199, 2026-11-15 15:00):** boot-arg `sweetfb_2x=1` presents the same 414x736 pt at
+@2x = 828x1472 (56% fewer pixels than 1242x2208) and stretches it to the 1080x1920 panel with the
+existing presentScaled row/column code (each panel pixel = average of the 2 logical neighbours).
+AppleCLCD::start also sets IODeviceTree:/chosen/display-scale = 2 (MobileGestalt reads it there).
+Without the boot-arg nothing changes. Kernel xnu100 = build203.sh (build202 + b199
+SweetFramebuffer.cpp), sha boot xnu100a 5cc801d7...; extra `sweetfb_hz=60 on7mali=1 on7malistep=8
+on7put=1 on7gl=1 glframes=1 sweetfb_2x=1`.
+- [O] boot 15:03: "SWEET FB: @2x, 828x1472 stretched to the panel"; CA swaps 828x1472 BGRA surfaces
+  (bpr 3328); eagl blits 4761 KB per frame (was 10712). No new crashes (driverkitd sig 9 and
+  PosterBoard sig 5 are the usual ones).
+- [?] Not yet checked: whether MobileGestalt's disk cache still answers scale 3 (layout would then
+  be 276x490 pt), sharpness of the stretch, touch, the user's feel; frame-time stats under use.
+
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
 - xnu95 = local build199.sh (0196 sweet_amfi.c, CI kern_exec.o of run 43649190007, payload
