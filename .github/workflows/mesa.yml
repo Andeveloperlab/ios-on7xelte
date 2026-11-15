@@ -38,7 +38,7 @@ jobs:
         run: |
           set -eux
           bison --version | head -1
-          WORK=$RUNNER_TEMP/mesa bash tools/mesa/mk-mesa-ios.sh out/lib
+          WORK=$RUNNER_TEMP/mesa SYMS=$RUNNER_TEMP/syms bash tools/mesa/mk-mesa-ios.sh out/lib
 
       - name: Programs
         run: |
@@ -72,6 +72,11 @@ jobs:
         with:
           name: gpu-userland
           path: out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gpu-symbols
+          path: ${{ runner.temp }}/syms
           retention-days: 14
 
       - uses: actions/upload-artifact@v4

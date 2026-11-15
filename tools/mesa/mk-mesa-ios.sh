@@ -76,6 +76,12 @@ for dep in $(otool -L $osm | awk 'NR > 1 { print $1 }' | grep -v '^/usr/lib/\|^/
 	cp "$src" "$OUT/$name"
 	install_name_tool -change "$dep" @rpath/$name "$OUT/libOSMesa.8.dylib"
 done
+# SYMS=DIR: the libraries as built, before strip -x (symbols of the static functions, for eagl's
+# glprof=US profile lines "hakios-prof: libOSMesa.8.dylib+0xOFFSET": the same offsets, strip changes no code)
+if [ -n "${SYMS:-}" ]; then
+	mkdir -p "$SYMS"
+	cp "$OUT"/*.dylib "$SYMS"/
+fi
 for f in "$OUT"/*.dylib; do
 	strip -x "$f"
 	install_name_tool -id @rpath/$(basename "$f") "$f"
