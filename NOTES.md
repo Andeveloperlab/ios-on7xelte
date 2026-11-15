@@ -664,9 +664,10 @@ for the user's OK: it raises the GPU voltage and clock):**
   buffer 22; `-attachImage: ... a texture, copied into its memory by the GPU`; frames now
   "0 pictures copied out, 1 drawn in place", copy-out 2-4 us (was ~140 ms); steady frames
   60-65 ms (xnu96: 150-200 ms), big frames 420-500 ms (xnu96: 920 ms). No crash in 3 min, no
-  late-job or pt-pool message. Screen NOT yet checked by the user.
+  late-job or pt-pool message.
+- [O] 2026-11-15: the user confirmed the UI is shown and touch works with xnu97g (zero-copy).
 - The phone is LEFT on xnu97g. Undo = flash xnu96g (glcopy) or a kernel without on7gl.
-- NEXT: (1) user checks screen/touch; (2) still ~15-20 ms "waiting" per frame and 17 ms+ per
+- NEXT: (1) [done]; (2) still ~15-20 ms "waiting" per frame and 17 ms+ per
   draw call batch: profile Mesa/panfrost (job submit, shader compile cache); (3) wrap client
   image (sel 6) like the A50's methodWrapClientImage instead of the 0197 refusal; (4) CI build
   of 0198.
