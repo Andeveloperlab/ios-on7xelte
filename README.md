@@ -1,146 +1,125 @@
-# ios-a10
+# ios-on7xelte
 
-**Bringing Apple's iOS 16 kernel and userland to the Samsung Galaxy A10 (SM-A105F).**
+**Apple's iOS 16 kernel and userland on the Samsung Galaxy J7 Prime (SM-G610F, `on7xelte`).**
 
-This is the Galaxy A10 branch of the ios-sweet work. It ports Apple's open-source XNU kernel (xnu-8796.141.3, the iOS 16 generation) to the Exynos 7884B, with the stock iOS 16.7.16 (20H392) iPhone X userland as the target. The original ios-sweet sources are the starting point; the platform layer here is Exynos-specific.
+This repository ports Apple's open-source XNU kernel (xnu-8796.141.3, the iOS 16 generation) to the
+Exynos 7870 and boots the stock iOS 16.7 (20H392) iPhone X userland from the phone's internal eMMC.
+CoreAnimation draws on the Mali-T830 GPU through Mesa's panfrost driver.
 
-> **Status: 2026-11-08, milestone M2 complete — M3 in progress.**
-> The A10 boots XNU through the IOKit platform expert, CPU bring-up and `bsd_init`; probe13 reached `bsd_autoconf`/`kminit` and brought up the loopback and tunnel interfaces. Probe15 selected the internal eMMC root (`rd=emmcroot0`, GPT partition `userdata`) and opened it read-only; the HFS+ mount fails only because `userdata` does not contain an HFS+ volume yet. A 20 GiB HFSX root image is now built in CI from the iPhone X IPSW, and probe16 plus the TWRP write ZIP are ready; the destructive write into `userdata` is pending. No iOS userland, `launchd` or GUI runs on the phone yet.
+> **Status: 2026-11-15, project paused.**
+> The J7 Prime boots XNU on all 8 cores, mounts an HFS+ iOS root from the `userdata` partition and
+> runs `launchd`, backboardd and SpringBoard. The home screen, touch, keyboard, Wi-Fi and Safari
+> work. CoreAnimation renders on the GPU with zero-copy IOSurfaces. The full engineering log and
+> the last hand-off are in [`NOTES.md`](NOTES.md).
 
 ## Device
 
 | | |
 | --- | --- |
-| Model | Samsung Galaxy A10, SM-A105F |
-| SoC | Exynos 7884B: 2× Cortex-A73 + 6× Cortex-A53, ARMv8.0 (no LSE, no PAN) |
-| RAM | 2 GB. The kernel payload uses bank 2: `0xC0000000` + `0x40000000` |
-| Storage | 32 GB eMMC (DW-MMC with 64-bit FIFO), plus a microSD card for flashing |
-| Display | 720×1600 S6D7AT0B panel; the bootloader leaves a framebuffer at `0xEC000000` |
-| Interrupts | GIC-400 (GICv2): distributor `0x12301000`, CPU interface `0x12302000` |
-| eMMC controller | `0x13500000`, CMDQ `0x13508000`, INTID 178 |
-| USB | Data lines are broken on this unit: no adb/fastboot. Every iteration is a TWRP ZIP on microSD |
+| Model | Samsung Galaxy J7 Prime, SM-G610F (`on7xelte`) |
+| SoC | Exynos 7870: 8x Cortex-A53, ARMv8.0 (no LSE, no PAN) |
+| GPU | Mali-T830 MP1 (Midgard), driven by our kernel backend + Mesa 25.0.7 panfrost |
+| Storage | eMMC; BOOT = `mmcblk0p10`, iOS root in `userdata` (`mmcblk0p25`), GPT unchanged |
+| Display | 1080x1920 TD4300 panel; the bootloader leaves the DECON scan-out buffer at `0x67000000` |
+| Interrupts | GIC-400 (GICv2): distributor `0x104E1000`, CPU interface `0x104E2000` |
+| USB | Works: adb/TWRP for flashing, and a USB ACM serial line for the kernel log and commands |
 
-The device is an experimental bring-up target. Android is already erased; the stock boot/recovery/modem/persist partitions were backed up before any work. iOS is intended to live in the existing `userdata` partition, without changing the GPT.
+The phone is an experimental bring-up target. Android has been removed from `userdata`; the
+bootloader, recovery (TWRP), modem, EFS/persist and the partition backups are kept intact.
 
-## Milestones
+## What works
 
-| Milestone | State |
+| Area | State |
 | --- | --- |
-| **M0** — EL1, live FDT, GICv2, framebuffer | ✅ confirmed on device (probe #1/#2) |
-| **M1** — eMMC read-only, 64-bit FIFO | ✅ confirmed on device (probe #8, 2026-11-07) |
-| **M2** — XNU boots on the A10 to the console | ✅ confirmed on device (probe #13, 2026-11-08): XNU reaches `bsd_init`/`kminit` |
-| **M3** — HFS+ root + `launchd` | 🔄 probe15 opened the eMMC root (`userdata`); 20 GiB HFSX image built in CI, write ZIP ready, not yet written |
-| **M4** — iOS GUI (SpringBoard, touch, buttons) | ⏳ blocked on M3 |
+| Kernel | XNU boots through the shim, 4K pages, GICv2, generic timer, 8-core SMP, CPU DVFS |
+| Storage | eMMC driver with multi-block and DMA reads, read/write HFS+ root in `userdata` |
+| Userland | `launchd`, backboardd, SpringBoard and system daemons from the iOS 16.7 root |
+| Display | Presented as an iPhone 8 Plus (1242x2208, 414x736 pt @3x) and scaled to the 1080x1920 panel on 4 CPU threads at 60 Hz |
+| Input | Touchscreen, hardware keys, on-screen keyboard |
+| Power | Battery level, panel brightness and sleep, RTC |
+| Wi-Fi | SDIO Broadcom chip with our own driver: scan, WPA2 join, DHCP, auto-join; Safari browses |
+| GPU | Mali-T830 power, MMU, job IRQs; Mesa panfrost in user space; CoreAnimation in backboardd draws through `libon7gl` (EAGLContext on Mesa) with zero-copy IOSurfaces |
 
-### What works today
+Experimental: the audio codec and speaker path, the `sweetfb_2x=1` @2x display mode (828x1472,
+about twice as fast on the GPU).
 
-- A shim packaged as an Android `boot.img` v1 enters EL1, reads the live FDT passed by SBOOT and loads an XNU payload with a generated Apple Device Tree.
-- XNU starts on the A10 with 4K pages, GICv2 interrupts, the generic timer and a framebuffer console at 720×1600.
-- The kernel reaches the IOKit platform expert; `AppleCLCD` publishes the display and the boot log is visible on the panel.
-- The `SweetCPU` personality matches the A10 CPU node, `ml_processor_register()` succeeds and the boot CPU enters `initCPU()`.
-- XNU completes CPU startup, `bsd_init` and `kminit`; `bsd_autoconf` configures `lo0`, `gif0` and `stf0` (probe #13).
-- The DW-MMC eMMC path reads CID, EXT_CSD, MBR (`0xAA55`) and the GPT header (`EFI PART`) using 64-bit FIFO elements.
-- The kernel contains no ARMv8.1 LSE instructions; CI scans for them.
-
-### What does not work yet
-
-- **SMP:** the A10 firmware accepts `PSCI CPU_ON` but secondary cores do not acknowledge it. Bring-up is single-CPU for now.
-- **iOS root:** there is no HFS+ volume yet, so `IOFindBSDRoot` mounts nothing. Probe15 validated the eMMC/GPT path; the 20 GiB HFSX image is built but not yet written to `userdata`, so `launchd` is still M3 work.
-- **GUI:** no SpringBoard, touch, buttons, battery, Wi-Fi, Bluetooth, cellular, audio, camera or GPU.
-- **USB:** no data connection; logs are read by photographing the screen or from the TWRP/ZIP log on the microSD card.
+Not working: cellular, Bluetooth, camera, sensors, Metal (apps that need Metal do not run).
 
 ## How it boots
 
 ```
-Samsung SBOOT (unlocked bootloader)
-  -> boot partition: Android boot.img v1
-     -> our shim: EL1, live FDT, copy XNU + ADT + boot_args
-        -> XNU-8796 -> IOKit platform expert -> framebuffer console
-           -> [M2] CPU startup, kperf, bsd_init
-              -> [M3] HFS+ root in userdata -> launchd
-                 -> [M4] backboardd + SpringBoard
+Samsung S-Boot (unlocked)
+  -> BOOT partition (p10): Samsung boot.img
+     -> shim (shim/on7xelte): EL1, display/PMU/CMU setup, copies XNU + ADT + boot-args
+        -> XNU-8796 (MACHINE_CONFIG=A5XELTE, Exynos 7870 addresses)
+           -> HFS+ root in userdata (rd=emmcroot0 emmcroot=USERDATA)
+              -> launchd -> backboardd (+ libon7gl, Mesa panfrost) -> SpringBoard
 ```
 
-Each probe is a self-contained TWRP ZIP. The installer backs up the current `boot` partition to `a10/backup/boot.before-probeNN.img`, writes the new image and keeps a log in `a10/probeNN.log`. `a10_restore_boot.zip` walks the backup chain and restores the newest known-good image.
+Every test is a temporary BOOT image: the phone is sent to TWRP over USB, the image is written to
+`mmcblk0p10`, read back and verified, and the phone reboots. The kernel log arrives over the USB
+serial line.
 
 ## Building
 
-The kernel is built by GitHub Actions on `macos-15` with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build): the workflow fetches xnu-8796.141.3, applies `xnu/patches/` in order and verifies A10 markers in the patched tree. A silently skipped patch fails the job.
+The kernel is built by GitHub Actions on `macos-15` with
+[blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build): `xnu.yml` fetches
+xnu-8796.141.3, applies `xnu/patches/` in order, scans for ARMv8.1 LSE instructions (the
+Cortex-A53 has none) and uploads `kernel.development.a5xelte`.
 
 ```sh
-gh workflow run xnu.yml -R Salomatin297/ios-a10
-gh run download RUN_ID -R Salomatin297/ios-a10 -n xnu-kernel -D ci/xnu-kernel-RUN_ID
+gh workflow run xnu.yml -R furkan-karapinar/ios-on7xelte
+gh run download RUN_ID -R furkan-karapinar/ios-on7xelte -n xnu-kernel -D ci/xnu-kernel-RUN_ID
 ```
 
-The downloaded `kernel.development.sweet` is packed into the boot image by the local bring-up scripts (`tools/mkadt-a10.py` for the A10 device tree, `tools/mkpayload.py` for the payload, and the A10 shim). The resulting image is wrapped into `a10_probeNN.zip` with the same TWRP installer used for the eMMC probes.
+`mesa.yml` builds Mesa (OSMesa + panfrost) for iOS arm64, the `hakios-drm` shim and
+`libon7gl.dylib` (artifact `gpu-userland`). The kernel installs `libon7gl` on the root at boot from
+an embedded payload (patch 0194, `tools/on7put-payload.py`).
 
-### Flash on the phone
+The boot image is made with `tools/mkpayload.py` (kernel + Apple Device Tree + boot-args) and
+`tools/on7xelte-pack-probe.py` (shim + payload into the Samsung boot image).
 
-1. Copy `a10_probeNN.zip` to the root of a FAT32 microSD card.
-2. TWRP → Mount → enable **Micro SD card**.
-3. Install → select the ZIP → swipe. Do **not** enable ZIP signature verification.
-4. Reboot and photograph the screen.
-5. Return the card: the previous boot image is in `a10/backup/`, the installer log in `a10/probeNN.log`.
+## Patch series
 
-Rollback: `a10_restore_boot.zip` searches for the newest `boot.before-probeNN.img`, then the known probe backups, then the stock image.
+`xnu/patches/` holds the whole series, applied in order. `0001`-`0083` are the ios-sweet base,
+`0084`-`0136` the Exynos A5XELTE series this port started from, `0137` onwards the J7 Prime work:
 
-## A10 patch series
-
-The A10 platform layer is a continuation of the ios-sweet patch series:
-
-| Patch | Content |
+| Patches | Content |
 | --- | --- |
-| `0084` | GIC-400 (GICv2) instead of GICv3; memory-mapped GICC/GICD; virtual timer INTID 27; no PAN |
-| `0085` | Remove `__ARM_16K_PG__`; 4K pages for ARMv8.0 cores |
-| `0086` | 4K user VA, `-mcpu=cortex-a53+crypto` (no LSE) |
-| `0087` | Early framebuffer at `0xEC000000` |
-| `0088` | Read-only DW-MMC probe |
-| `0089` | Startup progress markers |
-| `0090` | DW-MMC eMMC driver with 64-bit FIFO writes and block reads |
-| `0091` | `emmcroot0` root selection and mount diagnostics |
-| `0092` | `IOFindBSDRoot` hook for `emmcroot0` → `sweet_emmc_rootdev()` |
-| `0093` | `SweetCPU` personality for `arm,cortex-a53`, CPU match logging, IOKit/startup traces |
-| `0094` | Correct GICv2 `GICD_SGIR` self-SGI filter (`TargetListFilter` is bits `[25:24]`) and CPU-timeout diagnostics |
-
-CI checks a marker for every A10 patch, including the SGIR fix, so a patch that does not apply cleanly cannot produce a green build.
-
-## Differences from ios-sweet
-
-| | ios-sweet (Redmi Note 10 Pro) | ios-a10 (Galaxy A10) |
-| --- | --- | --- |
-| SoC | Qualcomm SM7150, 8 cores | Exynos 7884B, 2× A73 + 6× A53 |
-| Interrupts | GICv3 | GIC-400, GICv2 |
-| Page size | 16K | 4K |
-| CPU baseline | 6× A55 via PSCI | 1 boot CPU; secondary `CPU_ON` not acknowledged |
-| Boot | `fastboot boot`, nothing flashed | microSD/TWRP ZIP writes the `boot` partition |
-| Display | 1080×2400 panel presented as 1125×2436 | 720×1600 panel, kernel framebuffer console |
-| Storage | UFS driver | DW-MMC eMMC driver |
-| Status | iOS home screen | XNU console / IOKit; no userland yet |
-
-## Key hardware facts
-
-- Boot CPU: the first Cortex-A53 of cluster 1, MPIDR `0x100` (not `0x0`).
-- PSCI v0.1 through `smc`; `CPU_ON = 0xC4000003`. The firmware accepts it but does not start secondaries for our payload.
-- GICv2 `GICD_SGIR`: SGI INTID `[3:0]`, `CPUTargetList` `[23:16]`, `TargetListFilter` `[25:24]`; `0b10` targets the requesting CPU interface.
-- Kernel window: `0xC4000000..0xE8F00000`; panic log at `0xE8F00000`.
-- Current boot arguments: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress wdt=-1`.
+| `0084`-`0136` | GICv2, 4K pages, Cortex-A53 code generation, no PAN, eMMC + GPT root, AMFI bridge, DECON/IOSurface display bridge, SMP, touch, PMIC, USB ACM log, CPU DVFS |
+| `0137`-`0153` | Keys, touch, battery, RTC; parking hardware services that are missing; eMMC multi-block and DMA |
+| `0154`-`0159` | Panel brightness and sleep, audio codec and speaker path |
+| `0160`-`0186` | Wi-Fi: SDIO, firmware, scan, WPA2 handshake, DHCP, auto-join, apple80211 and IOKit registry for wifid |
+| `0184`, `0187`, `0188`, `0199` | iPhone 8 Plus scaled display, present timing, present thread with multi-core scaling, optional @2x |
+| `0189`-`0198` | Mali-T830 bring-up (reset, power, MMU, IRQ), HakiosMali backend for Mesa, GPU DVFS, `libon7gl` injection into backboardd, zero-copy IOSurface import |
 
 ## Repository layout
 
 | Path | Content |
 | --- | --- |
-| `xnu/patches/` | XNU patch series, applied in order by CI (A10 work starts at `0084`) |
-| `.github/workflows/xnu.yml` | macOS kernel build, LSE scan and A10 marker verification |
-| `tools/mkadt-a10.py` | Generates the A10 Apple Device Tree |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot arguments into the shim payload |
-| `tools/verify_a10_patches.py` | Replays the CI patch sequence locally and fails on any skipped patch |
-| `shim/` | ios-sweet's original shim sources (the A10 shim is a separate local bring-up tree) |
-| `NOTES.md` | Active engineering handoff: probe results, addresses, next actions |
+| `xnu/patches/` | XNU patch series |
+| `.github/workflows/` | `xnu.yml` (kernel), `mesa.yml` (GPU userland), root image workflows |
+| `shim/on7xelte/` | Boot shim for the J7 Prime |
+| `tools/mkadt.py`, `tools/mkadt_a5xelte.py` | Apple Device Tree generation |
+| `tools/eagl/` | `libon7gl`: EAGLContext for CoreAnimation on Mesa |
+| `tools/mesa/` | Mesa build for iOS, panfrost patches, `hakios-drm` |
+| `tools/on7wifid/` | User-space helper for the Wi-Fi bring-up |
+| `tools/on7xelte-*.py` | USB log, boot image packing, register and Wi-Fi helpers |
+| `NOTES.md` | Engineering log and hand-off: every boot, measurement and next step |
 
-Device dumps, partition backups, Apple firmware, IPSW files and generated root images are not in git.
+Device dumps, partition backups, serial numbers, Apple firmware, IPSW files and generated root
+images are not in git.
 
 ## Credits
 
-Built on Apple's open-source releases (XNU, IOHIDFamily, libpthread, HFS), [ios-sweet](https://github.com/dipa-studio/ios-sweet), the [ios-a30s](https://github.com/xJezykk/ios-a30s) Exynos 7904 port, [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Samsung/Exynos kernel sources and TWRP. iOS itself is Apple's and is not distributed here.
+Built on Apple's open-source releases (XNU, IOHIDFamily, libpthread, HFS),
+[ios-sweet](https://github.com/dipa-studio/ios-sweet), the A5XELTE Exynos series
+([orhunnx/ios-a5xelte](https://github.com/orhunnx/ios-a5xelte),
+[nickdemon22/ios-a51](https://github.com/nickdemon22/ios-a51)), the HakiOS Galaxy A50 port (Mali
+backend and `eagl.c`, MIT License, see `tools/eagl/README.md`), [Mesa](https://mesa3d.org)
+panfrost, [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build),
+[ipsw](https://github.com/blacktop/ipsw), Samsung's Exynos 7870 kernel sources and TWRP. iOS itself
+is Apple's and is not distributed here.
 
-This is an experimental port, not a usable phone OS. Apple's security model is largely disabled, and nothing personal should be stored on the device.
+This is an experimental port, not a usable phone OS. Apple's security model is largely disabled;
+do not store anything personal on the device.
