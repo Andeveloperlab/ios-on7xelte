@@ -616,6 +616,36 @@ for the user's OK: it raises the GPU voltage and clock):**
   this root is 16.7; backboardd crash loop = black screen -> undo: flash without on7gl.
   (5) then 0x7e zero-copy IOSurface import in HakiosMali for real speed.
 
+**xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
+injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
+- xnu95 = local build199.sh (0196 sweet_amfi.c, CI kern_exec.o of run 43649190007, payload
+  gleagl-43649189968 with libon7gl.dylib 564512 bytes), 16,546,936 bytes, sha 759faacf...
+- [O] `ON7 GL: AMFI dyld policy ... registered`, libon7gl written, `backboardd started with
+  DYLD_INSERT_LIBRARIES`, `dyld policy for backboardd[58]: allow all`, `8 of 8 methods of
+  EAGLContext are ours`, context `OpenGL ES 3.1 Mesa 25.0.7; Mali-T830 (Panfrost)`, IOSurface 2
+  BGRA 1242x2208 attached as a copy (glcopy), first 2 shaders compiled. Then
+  `CRASH backboardd[58] sig 11 far 0x30`, repeats on every restart.
+- [O] Symbolicated (runs 43659505622, 43660355742, 43660720450, 43661818405; slide 0x757c000):
+  pc __platform_memmove <- IOSurfaceClientGetBulkAttachments+68 <- IOSurfaceGetBulkAttachments
+  <- CA::Render::iosurface_get_edr_factor <- CA::WindowServer::IOSurface::wrap_buffer <-
+  CA::OGL::GLESContext::retain_image <- bind_image_impl <- render_contents_background.
+  IOSurfaceClientGetBulkAttachments does memmove(out, [client+0x70]+0x30, size): client+0x68 is
+  the kernel lock result, so +0x70 = result+0x08 = the STATE PAGE address, which is 0 here.
+  Not eagl.c: CA's own GL path wraps a layer image in an IOSurface (the SW renderer never does).
+- [O] SweetSurface (0046/0068) fills result+0x08 for every create/lookup (sels 0/4/34), so the
+  surface with state 0 is [G] one made another way: retain_image takes image kind 0x35 (IOSurface
+  image, [img+0x68]) or kind 0x18 -> CA::Render::Image::retain_iosurface (cache 0x1883c460c),
+  which has a page-alignment check (alignment_once) before 0x1883c4824 = [G] the "wrap the
+  client's memory without copying" road (IOSurface sel 6 WrapClientImage / 7 WrapClientMemory,
+  NOT implemented in SweetSurface). Disassembly of 0x1883c4824.. was started and STOPPED (user
+  paused the work) - run it: symbolicate disass="0x1883c4824:160".
+- Phone: restored with xnu95 + extra `sweetfb_hz=60 on7mali=1` (image xnu95n, sha 06b9d549...),
+  BOOT verified; first 35 s backboardd up, no crash (full UI not checked).
+- NEXT: (1) finish retain_iosurface disassembly, find which IOSurface call yields state 0;
+  (2) fix in SweetSurface (implement the wrap selector with a state page, or make it fail cleanly
+  so CA copies) - compare A50 MiniIOSurface.cpp returnSurface / client-memory surfaces;
+  (3) rebuild (build199.sh style), flash with on7gl=1 glcopy=1.
+
 ## >>> A10 PORT (Samsung Galaxy A10, SM-A105F) - active work 2026-11-08 <<<
 
 The A10 bring-up lives in `C:\Users\User\iOS-Port`; its consolidated handoff is
