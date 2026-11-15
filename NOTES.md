@@ -722,7 +722,12 @@ on7put=1 on7gl=1 glframes=1 sweetfb_2x=1`.
   (bpr 3328); eagl blits 4761 KB per frame (was 10712). No new crashes (driverkitd sig 9 and
   PosterBoard sig 5 are the usual ones).
 - [?] Not yet checked: whether MobileGestalt's disk cache still answers scale 3 (layout would then
-  be 276x490 pt), sharpness of the stretch, touch, the user's feel; frame-time stats under use.
+- [O] USER CONFIRMED (15:10): "faster, looks right" (layout fine, so MobileGestalt took scale 2).
+  fstat of the xnu100a boot vs the xnu97g boot before it: small frames (0-10 draws) median 15.9 ms
+  (was 25.2), mid (11-40) 34.1 ms (was 83.7, p90 67 vs 500), big (41+) 31.5 ms (was 309, n=2);
+  waiting median 4-7 ms (was 6-30). Use `sweetfb_2x=1` in every flash from now on.
+- NEXT (speed): make @2x the a5xelte default in code (keep `sweetfb_2x=0` to go back); then
+  `glenv=HMD=1` as default; then BO cache in hakios-drm/panfrost.
 
 **xnu95 BOOTED WITH on7gl=1 (2026-11-15 03:41, log candidates/xnu14/usblog-20261115-033643-ts.txt):
 injection + Mesa context WORK, backboardd then crash-loops; restored (xnu95n, no on7gl).**
