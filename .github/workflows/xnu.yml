@@ -18,6 +18,9 @@ on:
       runner:
         description: GitHub runner label (macos-15-intel when arm64 runners are out of capacity)
         default: macos-15
+      mesa_run:
+        description: run id of a successful mesa workflow; its gpu-userland files are embedded for on7put (empty = none)
+        default: ""
   push:
     branches: [main, on7xelte/fix-7870-addresses]
     paths:
@@ -64,6 +67,20 @@ jobs:
             grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           fi
           ls dxb/patches
+
+      - name: Download gpu-userland
+        if: ${{ inputs.mesa_run != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: gpu-userland
+          path: gpu-userland
+          run-id: ${{ inputs.mesa_run }}
+          github-token: ${{ github.token }}
+
+      - name: Make on7put payload patch
+        if: ${{ inputs.mesa_run != '' }}
+        run: |
+          python3 tools/mk-on7put-ci-patch.py gpu-userland "mesa-${{ inputs.mesa_run }}" dxb/patches/0200-on7xelte-gpu-payload.patch
 
       - name: Deps
         run: |
