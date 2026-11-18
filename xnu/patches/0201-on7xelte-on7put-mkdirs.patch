@@ -1,0 +1,88 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -18,6 +18,8 @@
+ #include <sys/fcntl.h>
+ #include <sys/uio.h>
+ #include <libkern/zlib.h>
++#include <sys/namei.h>
++#include <sys/vnode_internal.h>
+ 
+ struct on7put_file {
+ 	const char *path;
+@@ -183,6 +185,66 @@
+ 	return out;
+ }
+ 
++static int
++on7put_mkdir(const char *path)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct nameidata nd;
++	struct vnode_attr va;
++	vnode_t dvp = NULLVP, vp = NULLVP;
++	int err;
++
++	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT, UIO_SYSSPACE, CAST_USER_ADDR_T(path), ctx);
++	nd.ni_cnd.cn_flags |= WILLBEDIR;
++	if ((err = namei(&nd)) != 0) {
++		return err;
++	}
++	dvp = nd.ni_dvp;
++	vp = nd.ni_vp;
++	if (vp != NULLVP) {
++		err = 0;
++	} else {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_type, VDIR);
++		VATTR_SET(&va, va_mode, (mode_t)0755);
++		err = vn_create(dvp, &vp, &nd, &va, 0, 0, NULL, ctx);
++	}
++	nameidone(&nd);
++	if (vp != NULLVP) {
++		vnode_put(vp);
++	}
++	if (dvp != NULLVP) {
++		vnode_put(dvp);
++	}
++	return err;
++}
++
++static void
++on7put_mkparents(const char *path)
++{
++	char buf[160];
++	size_t n = strlen(path);
++
++	if (n == 0 || n >= sizeof(buf)) {
++		return;
++	}
++	memcpy(buf, path, n + 1);
++	for (size_t i = 1; i < n; i++) {
++		vnode_t v = NULLVP;
++
++		if (buf[i] != '/') {
++			continue;
++		}
++		buf[i] = '\0';
++		if (vnode_lookup(buf, 0, &v, vfs_context_kernel()) == 0) {
++			vnode_put(v);
++		} else {
++			printf("ON7 PUT: mkdir %s: %d\n", buf, on7put_mkdir(buf));
++		}
++		buf[i] = '/';
++	}
++}
++
+ static void
+ on7put_install(void)
+ {
+@@ -249,6 +311,9 @@
+ 			kfree_data(cur, (vm_size_t)curlen + 1);
+ 			cur = NULL;
+ 		}
++		if (err == ENOENT) {
++			on7put_mkparents(f->path);
++		}
+ 		err = on7put_write(f->path, data, f->len, f->mode, err == ENOENT);
+ 		if (err == 0 && (err = on7put_read(f->path, &cur, &curlen)) == 0) {
+ 			have = on7put_fnv(cur, curlen);
